@@ -17,8 +17,9 @@ from collections.abc import Callable
 from typing import Any
 
 from polyml.api.rest import PolymarketAPIError, RestClient
+from polyml.fees import fee_difference, fee_rate_from_market, protocol_fee
 from polyml.storage.db import Database
-from polyml.storage.models import parse_decimal, parse_money
+from polyml.storage.models import parse_decimal, parse_fee, parse_money
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,15 @@ class ActivityPoller:
             price = parse_money(execution.get("lastPx")) or parse_money(order.get("avgPx"))
             qty = parse_decimal(execution.get("lastShares"))
             cost = (price * qty) if (price is not None and qty is not None) else None
+            # Only the aggressor (taker) pays a fee. Estimate it from the model
+            # (using the market's own feeCoefficient) so the cost is known even
+            # before the receipt; reconcile against the actual fee the receipt
+            # reports. The execution carries the per-fill commission; pass it
+            # before the order so the per-fill amount wins over the order total.
+            is_taker = agg is not None
+            fee_rate = fee_rate_from_market(trade.get("market"))
+            est_fee = protocol_fee(qty, price, is_taker=is_taker, fee_rate=fee_rate)
+            actual_fee = parse_fee(execution, order)
             self.db.insert_activity(
                 activity_id=trade.get("id"),
                 activity_type=atype or "ACTIVITY_TYPE_TRADE",
@@ -244,6 +254,9 @@ class ActivityPoller:
                 is_aggressor=1 if agg else 0,
                 cost_basis=parse_money(trade.get("costBasis")) or cost,
                 realized_pnl=parse_money(trade.get("realizedPnl")),
+                est_fee=est_fee,
+                actual_fee=actual_fee,
+                fee_diff=fee_difference(actual_fee, est_fee),
                 create_time=execution.get("transactTime") or order.get("createTime")
                 or trade.get("createTime"),
                 raw=activity,

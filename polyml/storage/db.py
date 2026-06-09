@@ -121,9 +121,12 @@ CREATE TABLE IF NOT EXISTS activities (
     market_slug    TEXT,
     price          REAL,
     qty            REAL,
-    is_aggressor   INTEGER,
+    is_aggressor   INTEGER,                 -- 1 = taker (pays fee), 0 = maker
     cost_basis     REAL,
-    realized_pnl   REAL,
+    realized_pnl   REAL,                    -- authoritative, already net of fees
+    est_fee        REAL,                    -- modelled taker fee (polyml.fees)
+    actual_fee     REAL,                    -- fee reported on the trade receipt
+    fee_diff       REAL,                    -- actual_fee - est_fee (model error)
     create_time    TEXT,
     captured_at    TEXT NOT NULL,
     raw            TEXT NOT NULL,
@@ -201,11 +204,29 @@ class Database:
         self._lock = threading.Lock()
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so new
+        columns must be added explicitly for older databases to pick them up."""
+        added: dict[str, list[tuple[str, str]]] = {
+            "activities": [("est_fee", "REAL"), ("actual_fee", "REAL"), ("fee_diff", "REAL")],
+        }
+        for table, columns in added.items():
+            existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, col_type in columns:
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
 
     # --- low-level helpers -------------------------------------------------------
     def close(self) -> None:
-        self.conn.close()
+        # Take the write lock so we never close the connection out from under a
+        # worker-thread write that is still in flight during shutdown.
+        with self._lock:
+            self.conn.close()
 
     def __enter__(self) -> "Database":
         return self
@@ -325,6 +346,9 @@ class Database:
             "is_aggressor": kw.get("is_aggressor"),
             "cost_basis": kw.get("cost_basis"),
             "realized_pnl": kw.get("realized_pnl"),
+            "est_fee": kw.get("est_fee"),
+            "actual_fee": kw.get("actual_fee"),
+            "fee_diff": kw.get("fee_diff"),
             "create_time": kw.get("create_time"),
             "captured_at": now_iso(),
             "raw": self._dump(kw.get("raw")),

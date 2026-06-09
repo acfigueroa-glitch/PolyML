@@ -34,6 +34,39 @@ def parse_decimal(obj: Any) -> float | None:
     return parse_money(obj)
 
 
+# The actual fee charged on a fill, most-specific first. Verified against the
+# live API: an execution carries ``commissionNotionalCollected`` (the per-fill
+# fee) and the parent order carries ``commissionNotionalTotalCollected`` (the
+# order's running total). NB: these are *amounts*, distinct from the *rate*
+# (``feeCoefficient``) and the legacy ``commissionsBasisPoints`` — never treat
+# those as a fee amount.
+_FEE_AMOUNT_KEYS = (
+    "commissionNotionalCollected",       # per-fill (preferred)
+    "commissionNotionalTotalCollected",  # order-level running total (fallback)
+    "feeAmount",
+    "feePaid",
+    "fee",
+)
+
+
+def parse_fee(*payloads: Any) -> float | None:
+    """Actual fee charged, from one or more trade/execution/order payloads.
+
+    Returns the first parseable amount found under a known commission/fee key,
+    in payload order (pass the execution before the order so the per-fill fee
+    wins over the order's cumulative total). Returns ``None`` if no fee field is
+    present."""
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in _FEE_AMOUNT_KEYS:
+            if key in payload:
+                value = parse_money(payload[key])
+                if value is not None:
+                    return value
+    return None
+
+
 def parse_time(value: Any) -> datetime | None:
     """Parse an ISO-8601 timestamp (with optional trailing 'Z')."""
     if value is None:

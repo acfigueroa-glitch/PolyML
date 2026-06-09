@@ -227,7 +227,8 @@ class RestClient:
         return self.post("/order/preview", {"request": order})
 
     def create_order(self, order: dict[str, Any]) -> Any:
-        return self.post("/order", {"request": order})
+        # Create is POST /orders (plural); GET /orders is 501 Method Not Allowed.
+        return self.post("/orders", {"request": order})
 
     def cancel_order(self, order_id: str) -> Any:
         return self.post("/order/cancel", {"request": {"orderId": order_id}})

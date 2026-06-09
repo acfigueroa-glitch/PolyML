@@ -10,6 +10,23 @@ def _db(tmp_path) -> Database:
     return Database(tmp_path / "test.db")
 
 
+def test_writes_from_worker_threads(tmp_path):
+    """The async runner writes from asyncio.to_thread workers, so the Database
+    must tolerate cross-thread access (regression test for a silent failure)."""
+    import concurrent.futures
+
+    db = _db(tmp_path)
+
+    def writer(i: int) -> None:
+        db.insert_balance(float(i), float(i), float(i), raw={"i": i})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(writer, range(50)))
+
+    assert db.query_one("SELECT COUNT(*) AS n FROM balance_snapshots")["n"] == 50
+    db.close()
+
+
 def test_insert_and_count(tmp_path):
     db = _db(tmp_path)
     book = OrderBook.from_payload(

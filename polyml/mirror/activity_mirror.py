@@ -61,15 +61,24 @@ class ActivityMirror:
     async def handle(self, message: dict[str, Any]) -> None:
         """Entry point passed to ``PrivateWebSocket(on_message=...)``."""
         sub_type = message.get("subscriptionType", "")
+        # The stream emits an empty ``error`` field as a benign EOF marker on
+        # snapshots; only surface non-empty errors.
+        if message.get("error"):
+            logger.warning("private stream error: %s", message["error"])
         if "orderSubscriptionSnapshot" in message:
             self._handle_order_snapshot(message["orderSubscriptionSnapshot"])
         elif "orderSubscriptionUpdate" in message:
             self._handle_order_update(message["orderSubscriptionUpdate"])
+        elif "positionSubscriptionSnapshot" in message:
+            for pos in message["positionSubscriptionSnapshot"].get("positions", []):
+                self._handle_position(pos)
         elif "positionSubscription" in message:
             self._handle_position(message["positionSubscription"])
+        elif "accountBalancesSnapshot" in message:
+            self._handle_balance_snapshot(message["accountBalancesSnapshot"])
         elif "accountBalancesUpdate" in message:
             self._handle_balance(message["accountBalancesUpdate"])
-        else:
+        elif not message.get("error"):
             logger.debug("unhandled private message: %s", sub_type or list(message.keys()))
 
     # --- handlers ----------------------------------------------------------------
@@ -150,7 +159,20 @@ class ActivityMirror:
         self.db.insert_balance(
             buying_power=parse_money(after.get("buyingPower")),
             total_value=parse_money(after.get("totalValue")),
-            cash=parse_money(after.get("cash")),
+            cash=parse_money(after.get("cash") or after.get("currentBalance")),
+            raw=payload,
+        )
+
+    def _handle_balance_snapshot(self, payload: dict[str, Any]) -> None:
+        """Initial balance snapshot: a ``balances`` list (same shape as REST)."""
+        balances = payload.get("balances", [])
+        data = balances[0] if isinstance(balances, list) and balances else {}
+        cash = parse_money(data.get("currentBalance"))
+        asset = parse_money(data.get("assetNotional")) or 0.0
+        self.db.insert_balance(
+            buying_power=parse_money(data.get("buyingPower")),
+            total_value=(cash + asset) if cash is not None else None,
+            cash=cash,
             raw=payload,
         )
 

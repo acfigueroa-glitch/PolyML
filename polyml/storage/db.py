@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -192,10 +193,15 @@ class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # The async runner writes from worker threads (asyncio.to_thread) and the
+        # WebSocket callbacks, so allow cross-thread use and serialise access with
+        # a lock to keep writes safe.
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        self._lock = threading.Lock()
+        with self._lock:
+            self.conn.executescript(SCHEMA)
+            self.conn.commit()
 
     # --- low-level helpers -------------------------------------------------------
     def close(self) -> None:
@@ -207,27 +213,37 @@ class Database:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
+        """Run a write statement under the lock and commit."""
+        with self._lock:
+            self.conn.execute(sql, tuple(params))
+            self.conn.commit()
+
     def _insert(self, table: str, row: dict[str, Any]) -> int:
         cols = ", ".join(row)
         placeholders = ", ".join("?" for _ in row)
         sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
-        cur = self.conn.execute(sql, list(row.values()))
-        self.conn.commit()
-        return int(cur.lastrowid)
+        with self._lock:
+            cur = self.conn.execute(sql, list(row.values()))
+            self.conn.commit()
+            return int(cur.lastrowid)
 
     def _insert_or_ignore(self, table: str, row: dict[str, Any]) -> int | None:
         cols = ", ".join(row)
         placeholders = ", ".join("?" for _ in row)
         sql = f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})"
-        cur = self.conn.execute(sql, list(row.values()))
-        self.conn.commit()
-        return int(cur.lastrowid) if cur.rowcount else None
+        with self._lock:
+            cur = self.conn.execute(sql, list(row.values()))
+            self.conn.commit()
+            return int(cur.lastrowid) if cur.rowcount else None
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-        return list(self.conn.execute(sql, tuple(params)).fetchall())
+        with self._lock:
+            return list(self.conn.execute(sql, tuple(params)).fetchall())
 
     def query_one(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
-        return self.conn.execute(sql, tuple(params)).fetchone()
+        with self._lock:
+            return self.conn.execute(sql, tuple(params)).fetchone()
 
     # --- typed inserts -----------------------------------------------------------
     @staticmethod
@@ -316,7 +332,7 @@ class Database:
         return self._insert_or_ignore("activities", row)
 
     def insert_outcome(self, slug: str, resolved_value, resolution_time, raw: Any) -> None:
-        self.conn.execute(
+        self.execute(
             """INSERT INTO outcomes (market_slug, resolved_value, resolution_time, captured_at, raw)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(market_slug) DO UPDATE SET
@@ -326,7 +342,6 @@ class Database:
                  raw=excluded.raw""",
             (slug, resolved_value, resolution_time, now_iso(), self._dump(raw)),
         )
-        self.conn.commit()
 
     # --- sessions ----------------------------------------------------------------
     def get_or_open_session(self, slug: str) -> int:
@@ -343,19 +358,17 @@ class Database:
         )
 
     def conclude_session(self, session_id: int, outcome_value, realized_pnl) -> None:
-        self.conn.execute(
+        self.execute(
             "UPDATE sessions SET status='concluded', concluded_at=?, outcome_value=?, realized_pnl=? "
             "WHERE id=? AND status='open'",
             (now_iso(), outcome_value, realized_pnl, session_id),
         )
-        self.conn.commit()
 
     def mark_session_analyzed(self, session_id: int, summary: str) -> None:
-        self.conn.execute(
+        self.execute(
             "UPDATE sessions SET status='analyzed', analyzed_at=?, summary=? WHERE id=?",
             (now_iso(), summary, session_id),
         )
-        self.conn.commit()
 
     def insert_decision(self, **kw: Any) -> int | None:
         row = {

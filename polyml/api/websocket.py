@@ -21,13 +21,21 @@ re-applies its subscriptions. Messages are handed to an async callback.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import websockets
-from websockets.client import WebSocketClientProtocol
+
+# websockets renamed the connect-time header kwarg from ``extra_headers`` (<14)
+# to ``additional_headers`` (>=14). Detect which one this install accepts.
+try:
+    _CONNECT_PARAMS = set(inspect.signature(websockets.connect).parameters)
+except (ValueError, TypeError):  # pragma: no cover - signature unavailable
+    _CONNECT_PARAMS = {"additional_headers"}
+_HEADERS_KWARG = "additional_headers" if "additional_headers" in _CONNECT_PARAMS else "extra_headers"
 
 from polyml.api.auth import Ed25519Signer
 
@@ -60,7 +68,7 @@ class _BaseWebSocket:
         self.on_message = on_message
         self.name = name
         self._subscriptions: list[dict[str, Any]] = []
-        self._ws: WebSocketClientProtocol | None = None
+        self._ws: Any = None
         self._stop = asyncio.Event()
 
     def add_subscription(self, message: dict[str, Any]) -> None:
@@ -73,7 +81,7 @@ class _BaseWebSocket:
         headers = self.signer.headers("GET", _handshake_path(self.url))
         return list(headers.items())
 
-    async def _send(self, ws: WebSocketClientProtocol, message: dict[str, Any]) -> None:
+    async def _send(self, ws: Any, message: dict[str, Any]) -> None:
         await ws.send(json.dumps(message))
 
     async def run(self) -> None:
@@ -82,15 +90,15 @@ class _BaseWebSocket:
         Reconnects with exponential backoff on any connection error.
         """
         backoff = 1.0
+        connect_kwargs: dict[str, Any] = {
+            "ping_interval": 20,
+            "ping_timeout": 20,
+            "max_size": 8 * 1024 * 1024,
+            _HEADERS_KWARG: self._auth_headers(),
+        }
         while not self._stop.is_set():
             try:
-                async with websockets.connect(
-                    self.url,
-                    extra_headers=self._auth_headers(),
-                    ping_interval=20,
-                    ping_timeout=20,
-                    max_size=8 * 1024 * 1024,
-                ) as ws:
+                async with websockets.connect(self.url, **connect_kwargs) as ws:
                     self._ws = ws
                     backoff = 1.0
                     for sub in self._subscriptions:

@@ -1,32 +1,42 @@
 """The bot's understanding of the Polymarket US fee structure.
 
-Docs: a taker pays ``fee = contracts * fee_rate * price * (1 - price)`` (sports
-rate 0.03), rounded to 5 decimals; makers pay nothing.
+Verified against the live API: a taker pays
+``fee = contracts * feeCoefficient * price * (1 - price)``; the per-market
+``feeCoefficient`` is 0.05 for AEC sports markets, the per-fill amount is
+reported as ``commissionNotionalCollected``, rounded to the cent. Makers pay
+nothing.
 """
 
-from polyml.fees import fee_difference, fee_rate_for, protocol_fee
+from polyml.fees import (
+    fee_difference,
+    fee_rate_for,
+    fee_rate_from_market,
+    protocol_fee,
+)
 from polyml.mirror import ActivityPoller
 from polyml.storage.db import Database
 
 
-def test_protocol_fee_matches_docs_example():
-    # 10 contracts sold at ~0.131 -> 10 * 0.03 * 0.131 * 0.869 = 0.03415 (5 dp).
-    assert protocol_fee(10, 0.131) == round(10 * 0.03 * 0.131 * (1 - 0.131), 5)
-    assert protocol_fee(10, 0.131) == 0.03415
+def test_protocol_fee_matches_live_receipt():
+    # Live receipt: 10 shares @ 0.20, feeCoefficient 0.05 -> commission $0.0800.
+    assert protocol_fee(10, 0.20, fee_rate=0.05) == 0.08
+    # And the documented form holds for an arbitrary fill.
+    assert protocol_fee(96, 0.19, fee_rate=0.05) == round(96 * 0.05 * 0.19 * 0.81, 5)
 
 
 def test_fee_peaks_at_fifty_percent_and_is_symmetric():
-    # price * (1 - price) is symmetric about 0.5 and maximal there.
     assert protocol_fee(100, 0.5) > protocol_fee(100, 0.2)
     assert protocol_fee(100, 0.2) == protocol_fee(100, 0.8)
 
 
-def test_makers_pay_nothing():
-    assert protocol_fee(27, 0.53, is_taker=False) == 0.0
+def test_makers_receive_a_rebate():
+    # Makers are paid a small rebate (negative fee), not zero.
+    fee = protocol_fee(27, 0.53, is_taker=False)
+    assert fee < 0.0
+    assert fee == round(-0.0107 * 27 * 0.53 * 0.47, 5)
 
 
 def test_no_fee_at_or_beyond_the_bounds():
-    # A settled instrument (price 0 or 1) and degenerate inputs incur no fee.
     assert protocol_fee(10, 1.0) == 0.0
     assert protocol_fee(10, 0.0) == 0.0
     assert protocol_fee(0, 0.5) == 0.0
@@ -34,103 +44,112 @@ def test_no_fee_at_or_beyond_the_bounds():
 
 
 def test_tiny_fees_round_to_zero():
-    # A single share at a very low price rounds below the 5th decimal:
-    # 1 * 0.03 * 0.0001 * 0.9999 = 3.0e-6 -> 0.00000.
+    # 1 * 0.05 * 0.0001 * 0.9999 = 5.0e-6 -> 0.00000.
     assert protocol_fee(1, 0.0001) == 0.0
 
 
 def test_fee_rate_defaults_to_sports():
-    assert fee_rate_for("sports") == 0.03
-    assert fee_rate_for("SPORTS") == 0.03
-    assert fee_rate_for(None) == 0.03
-    assert fee_rate_for("unknown-category") == 0.03
+    assert fee_rate_for("sports") == 0.05
+    assert fee_rate_for(None) == 0.05
+    assert fee_rate_for("unknown-category") == 0.05
+
+
+def test_fee_rate_read_from_market_coefficient():
+    assert fee_rate_from_market({"feeCoefficient": 0.05}) == 0.05
+    assert fee_rate_from_market({"feeCoefficient": "0.07"}) == 0.07
+    assert fee_rate_from_market({}) == 0.05          # falls back to default
+    assert fee_rate_from_market(None) == 0.05
 
 
 def test_fee_difference_only_when_actual_known():
-    assert fee_difference(0.05, 0.03) == 0.02
-    assert fee_difference(None, 0.03) is None
+    assert fee_difference(0.08, 0.08) == 0.0
+    assert fee_difference(None, 0.08) is None
 
 
-def test_taker_trade_stores_estimated_fee(tmp_path):
-    db = Database(tmp_path / "t.db")
-    activity = {
-        "type": "ACTIVITY_TYPE_TRADE",
-        "trade": {
-            "id": "FEE1",
-            "aggressorExecution": {  # aggressor => taker => pays a fee
-                "order": {"marketSlug": "aec-atp-x-y-2026-06-09", "intent": "ORDER_INTENT_SELL_LONG"},
-                "lastShares": "10.0000",
-                "lastPx": {"value": "0.1310", "currency": "USD"},
-                "type": "EXECUTION_TYPE_FILL",
-                "transactTime": "2026-06-09T13:15:13Z",
-            },
-            "passiveExecution": None,
-        },
+def _trade_activity(trade_id, *, aggressor=True, extra_exec=None, market=None):
+    exec_block = {
+        "order": {"marketSlug": "aec-wta-x-y-2026-06-09", "intent": "ORDER_INTENT_BUY_LONG"},
+        "lastShares": "10.0000",
+        "lastPx": {"value": "0.2000", "currency": "USD"},
+        "type": "EXECUTION_TYPE_FILL",
+        "transactTime": "2026-06-09T19:44:14Z",
     }
-    ActivityPoller(rest=None, db=db)._store(activity)
+    if extra_exec:
+        exec_block.update(extra_exec)
+    trade = {
+        "id": trade_id,
+        "market": market if market is not None else {"feeCoefficient": 0.05},
+        "aggressorExecution": exec_block if aggressor else None,
+        "passiveExecution": None if aggressor else exec_block,
+    }
+    return {"type": "ACTIVITY_TYPE_TRADE", "trade": trade}
+
+
+def test_taker_trade_estimates_fee_from_coefficient(tmp_path):
+    db = Database(tmp_path / "t.db")
+    ActivityPoller(rest=None, db=db)._store(_trade_activity("FEE1"))
     row = db.query_one("SELECT * FROM activities WHERE activity_id='FEE1'")
     assert row["is_aggressor"] == 1
-    assert row["est_fee"] == 0.03415
-    assert row["actual_fee"] is None  # fixture omits a fee field
-    assert row["fee_diff"] is None
+    assert row["est_fee"] == 0.08            # 10 * 0.05 * 0.20 * 0.80
+    assert row["actual_fee"] is None         # no commission field in this fixture
     db.close()
 
 
-def test_maker_trade_estimates_zero_fee(tmp_path):
+def test_maker_trade_estimates_a_rebate(tmp_path):
     db = Database(tmp_path / "t.db")
-    activity = {
-        "type": "ACTIVITY_TYPE_TRADE",
-        "trade": {
-            "id": "FEE2",
-            "aggressorExecution": None,
-            "passiveExecution": {  # passive => maker => no fee
-                "order": {"marketSlug": "aec-atp-x-y-2026-06-09", "intent": "ORDER_INTENT_SELL_LONG"},
-                "lastShares": "10.0000",
-                "lastPx": {"value": "0.1310", "currency": "USD"},
-                "type": "EXECUTION_TYPE_FILL",
-                "transactTime": "2026-06-09T13:15:13Z",
-            },
-        },
-    }
-    ActivityPoller(rest=None, db=db)._store(activity)
+    ActivityPoller(rest=None, db=db)._store(_trade_activity("FEE2", aggressor=False))
     row = db.query_one("SELECT * FROM activities WHERE activity_id='FEE2'")
     assert row["is_aggressor"] == 0
-    assert row["est_fee"] == 0.0
+    assert row["est_fee"] == round(-0.0107 * 10 * 0.20 * 0.80, 5)  # rebate, negative
     db.close()
 
 
-def test_actual_fee_reconciled_when_receipt_reports_it(tmp_path):
+def test_actual_fee_from_commission_field_reconciles(tmp_path):
     db = Database(tmp_path / "t.db")
-    activity = {
-        "type": "ACTIVITY_TYPE_TRADE",
-        "trade": {
-            "id": "FEE3",
-            "aggressorExecution": {
-                "order": {"marketSlug": "aec-atp-x-y-2026-06-09", "intent": "ORDER_INTENT_SELL_LONG"},
-                "lastShares": "10.0000",
-                "lastPx": {"value": "0.1310", "currency": "USD"},
-                "fee": {"value": "0.0400", "currency": "USD"},
-                "type": "EXECUTION_TYPE_FILL",
-                "transactTime": "2026-06-09T13:15:13Z",
-            },
-            "passiveExecution": None,
-        },
-    }
-    ActivityPoller(rest=None, db=db)._store(activity)
+    # The execution reports the real per-fill commission.
+    ActivityPoller(rest=None, db=db)._store(
+        _trade_activity(
+            "FEE3",
+            extra_exec={"commissionNotionalCollected": {"value": "0.0800", "currency": "USD"}},
+        )
+    )
     row = db.query_one("SELECT * FROM activities WHERE activity_id='FEE3'")
-    assert row["actual_fee"] == 0.04
-    assert row["est_fee"] == 0.03415
-    assert row["fee_diff"] == round(0.04 - 0.03415, 5)
+    assert row["actual_fee"] == 0.08
+    assert row["est_fee"] == 0.08
+    assert row["fee_diff"] == 0.0
+    db.close()
+
+
+def test_rate_and_basis_points_are_not_mistaken_for_a_fee(tmp_path):
+    # feeCoefficient (a rate) and commissionsBasisPoints (legacy, here 0) must
+    # NOT be parsed as the actual fee amount.
+    db = Database(tmp_path / "t.db")
+    ActivityPoller(rest=None, db=db)._store(
+        _trade_activity(
+            "FEE4",
+            market={"feeCoefficient": 0.05},
+            extra_exec={
+                "order": {
+                    "marketSlug": "aec-wta-x-y-2026-06-09",
+                    "intent": "ORDER_INTENT_BUY_LONG",
+                    "commissionsBasisPoints": "0",
+                    "makerCommissionsBasisPoints": "0",
+                },
+                "commissionSpreadPx": {"value": "0.2000", "currency": "USD"},
+            },
+        )
+    )
+    row = db.query_one("SELECT * FROM activities WHERE activity_id='FEE4'")
+    # No real commission amount present -> actual_fee stays None (not 0.05/0.20).
+    assert row["actual_fee"] is None
     db.close()
 
 
 def test_migration_adds_fee_columns_to_existing_db(tmp_path):
-    # Simulate an older database whose activities table lacks the fee columns.
     import sqlite3
 
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)
-    # The prior activities schema: same columns minus the fee additions.
     conn.execute(
         "CREATE TABLE activities (id INTEGER PRIMARY KEY AUTOINCREMENT, activity_id TEXT, "
         "activity_type TEXT NOT NULL, market_slug TEXT, price REAL, qty REAL, "
@@ -140,7 +159,7 @@ def test_migration_adds_fee_columns_to_existing_db(tmp_path):
     conn.commit()
     conn.close()
 
-    db = Database(path)  # opening it should add the new columns
+    db = Database(path)
     cols = {row["name"] for row in db.query("PRAGMA table_info(activities)")}
     assert {"est_fee", "actual_fee", "fee_diff"} <= cols
     db.close()

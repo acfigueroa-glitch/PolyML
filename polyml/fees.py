@@ -9,7 +9,9 @@ term peaks at a 50% price and vanishes as the price approaches 0 or 1, so fees
 are largest on coin-flip markets and tiny on lopsided ones — which is why a
 small fill near a low probability can round all the way down to $0.
 
-``fee_rate`` depends on the market category (sports is ``0.03``).
+``fee_rate`` is the market's ``feeCoefficient`` (0.05 for the AEC sports
+markets, confirmed against live receipts: a 10-share fill at 0.20 reports a
+``commissionNotionalCollected`` of exactly 10 * 0.05 * 0.20 * 0.80 = $0.08).
 
 The bot uses this in two ways:
 
@@ -22,20 +24,39 @@ The bot uses this in two ways:
 
 from __future__ import annotations
 
-# Per-category taker fee rates. Sports is 0.03 per the docs; until a category's
-# rate is confirmed we fall back to the sports rate.
-DEFAULT_FEE_RATE = 0.03
-FEE_RATES: dict[str, float] = {"sports": 0.03}
+# Fallback taker fee rate. The authoritative rate is the per-market
+# ``feeCoefficient`` (see ``fee_rate_from_market``); this is only used when a
+# payload doesn't carry one. Observed live value for AEC sports markets is 0.05.
+DEFAULT_FEE_RATE = 0.05
+FEE_RATES: dict[str, float] = {"sports": 0.05}
+
+# Makers are not free: real receipts show them receiving a small *rebate* (a
+# negative fee). Fit across 991 live fills gives a maker rate of ~-0.0107 vs the
+# +0.05 taker rate (~21% of it). Approximate — refine as more fills accrue.
+MAKER_REBATE_RATE = 0.0107
 
 # The protocol rounds fees to 5 decimals; sub-$0.00001 fees become exactly zero.
 FEE_DECIMALS = 5
 
 
 def fee_rate_for(category: str | None = None) -> float:
-    """Taker fee rate for a market category (defaults to the sports rate)."""
+    """Fallback taker fee rate for a market category (defaults to sports)."""
     if not category:
         return DEFAULT_FEE_RATE
     return FEE_RATES.get(category.lower(), DEFAULT_FEE_RATE)
+
+
+def fee_rate_from_market(market: object, default: float = DEFAULT_FEE_RATE) -> float:
+    """The market's ``feeCoefficient`` if present, else ``default``.
+
+    The live API carries the authoritative rate per market under
+    ``trade.market.feeCoefficient`` (e.g. 0.05 for AEC sports markets)."""
+    if isinstance(market, dict) and market.get("feeCoefficient") is not None:
+        try:
+            return float(market["feeCoefficient"])
+        except (TypeError, ValueError):
+            pass
+    return default
 
 
 def protocol_fee(
@@ -44,21 +65,24 @@ def protocol_fee(
     *,
     is_taker: bool = True,
     fee_rate: float = DEFAULT_FEE_RATE,
+    maker_rebate_rate: float = MAKER_REBATE_RATE,
 ) -> float:
-    """Estimated protocol fee for a single fill.
+    """Estimated fee for a single fill (positive = charged, negative = rebate).
 
     ``contracts`` is the number of shares (sign is ignored), ``price`` is the
-    fill price in dollars (0..1). Makers (``is_taker=False``) pay nothing, and a
-    price outside the open interval (0, 1) — e.g. a resolved settlement at 0 or 1
-    — incurs no fee.
+    fill price in dollars (0..1). Takers pay ``+fee_rate * shares * p * (1-p)``;
+    makers receive a rebate ``-maker_rebate_rate * shares * p * (1-p)``. A price
+    outside the open interval (0, 1) — e.g. a resolved settlement at 0 or 1 —
+    incurs neither.
     """
-    if not is_taker or contracts is None or price is None:
+    if contracts is None or price is None:
         return 0.0
     c = abs(float(contracts))
     p = float(price)
     if c <= 0.0 or not (0.0 < p < 1.0):
         return 0.0
-    return round(c * fee_rate * p * (1.0 - p), FEE_DECIMALS)
+    rate = fee_rate if is_taker else -maker_rebate_rate
+    return round(c * rate * p * (1.0 - p), FEE_DECIMALS)
 
 
 def fee_difference(actual_fee: float | None, estimated_fee: float | None) -> float | None:

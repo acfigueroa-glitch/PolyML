@@ -34,29 +34,34 @@ def parse_decimal(obj: Any) -> float | None:
     return parse_money(obj)
 
 
-# Candidate keys the API might use for the trade fee, most-specific first. The
-# live fixtures don't yet pin the exact name, so we also fall back to any key
-# containing "fee" (ignoring booleans like "feePayer").
-_FEE_KEYS = ("fee", "feeAmount", "feePaid", "takerFee", "fees", "commission")
+# The actual fee charged on a fill, most-specific first. Verified against the
+# live API: an execution carries ``commissionNotionalCollected`` (the per-fill
+# fee) and the parent order carries ``commissionNotionalTotalCollected`` (the
+# order's running total). NB: these are *amounts*, distinct from the *rate*
+# (``feeCoefficient``) and the legacy ``commissionsBasisPoints`` — never treat
+# those as a fee amount.
+_FEE_AMOUNT_KEYS = (
+    "commissionNotionalCollected",       # per-fill (preferred)
+    "commissionNotionalTotalCollected",  # order-level running total (fallback)
+    "feeAmount",
+    "feePaid",
+    "fee",
+)
 
 
 def parse_fee(*payloads: Any) -> float | None:
-    """Best-effort actual fee from one or more trade/execution payloads.
+    """Actual fee charged, from one or more trade/execution/order payloads.
 
-    Checks the known fee keys across each payload, then any ``*fee*`` key, and
-    returns the first parseable money value. Returns ``None`` if no fee field is
-    present (e.g. a maker fill, or an API shape that omits it)."""
+    Returns the first parseable amount found under a known commission/fee key,
+    in payload order (pass the execution before the order so the per-fill fee
+    wins over the order's cumulative total). Returns ``None`` if no fee field is
+    present."""
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        for key in _FEE_KEYS:
+        for key in _FEE_AMOUNT_KEYS:
             if key in payload:
                 value = parse_money(payload[key])
-                if value is not None:
-                    return value
-        for key, raw in payload.items():
-            if "fee" in key.lower() and not isinstance(raw, bool):
-                value = parse_money(raw)
                 if value is not None:
                     return value
     return None

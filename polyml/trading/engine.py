@@ -340,19 +340,23 @@ class TradeEngine:
 
     def _poll_market_states(self) -> None:
         for slug in list(self.watchlist):
+            if slug in self._finalized:
+                continue
+            # The order book (public) carries a reliable real-time market state.
             try:
-                payload = self.rest.get_market(slug)
+                payload = self.rest.get_market_book(slug)
             except Exception:  # noqa: BLE001
                 continue
             if not payload:
                 continue
-            market = payload.get("market", payload)
-            self.db.insert_market_snapshot(
-                slug, market.get("title") or market.get("question"), market.get("state"), payload
-            )
-            if self._is_resolved(market):
-                logger.info("[%s] market resolved — finalizing game", slug)
-                self.finalize_game(slug)
+            book = OrderBook.from_payload(payload)
+            if not book.market_slug:
+                book.market_slug = slug
+            self.db.insert_book_snapshot(book, source="poll", raw=payload)
+            self.db.insert_market_snapshot(slug, None, book.state, payload)
+            if book.state in TERMINAL_STATES:
+                logger.info("[%s] market resolved (state=%s) — finalizing game", slug, book.state)
+                self.finalize_game(slug, book=book)
 
     async def _top_up_games(self) -> None:
         target = self.config.get("trading.max_games", 5)

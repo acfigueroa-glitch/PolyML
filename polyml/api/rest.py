@@ -174,7 +174,10 @@ class RestClient:
         return self.get("/markets", params=params, auth=True)
 
     def get_market(self, slug: str) -> Any:
-        return self.get(f"/markets/{slug}", auth=True)
+        # The single-slug path 404s on the live API; query the collection instead.
+        resp = self.get("/markets", params={"slug": slug}, auth=True) or {}
+        markets = resp.get("markets", []) if isinstance(resp, dict) else []
+        return {"market": markets[0]} if markets else None
 
     def get_market_bbo(self, slug: str) -> Any:
         return self.get(f"/markets/{slug}/bbo", auth=True)

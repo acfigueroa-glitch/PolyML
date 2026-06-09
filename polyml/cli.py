@@ -157,6 +157,8 @@ def cmd_trade(config, args) -> int:
         overrides.setdefault("trading", {})["mode"] = "live"
     if args.market:
         overrides.setdefault("trading", {})["market_slugs"] = args.market
+        # When you name the game(s), trade only those — don't auto-add more.
+        overrides.setdefault("trading", {})["max_games"] = len(args.market)
     if overrides:
         config = load_config(overrides)
 

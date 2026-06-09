@@ -138,9 +138,9 @@ class RestClient:
     def post(self, path: str, body_obj: Any, *, auth: bool = True) -> Any:
         """Signed POST with a JSON body. Used only by the trading layer.
 
-        The signed message for writes is ``"{ts}POST{path}{body}"`` — the body is
-        folded in so it can't be tampered with. ``preview_order`` is the safe way
-        to confirm POST signing works before placing a real order.
+        Verified against the live API: writes sign the path ONLY (no query, no
+        body) — the same scheme as GET. ``preview_order`` is the safe way to
+        confirm signing + schema before placing a real order.
         """
         body = json.dumps(body_obj, separators=(",", ":")) if body_obj is not None else ""
         url = f"{self.rest_base_url}{path}"
@@ -148,8 +148,7 @@ class RestClient:
         if auth:
             if self.signer is None:
                 raise PolymarketAPIError(401, url, "Authenticated call requires credentials")
-            sign_path = httpx.URL(url).path
-            headers.update(self.signer.headers("POST", sign_path, body=body, include_body=True))
+            headers.update(self.signer.headers("POST", httpx.URL(url).path))
 
         attempt = 0
         while True:
@@ -159,7 +158,7 @@ class RestClient:
             time.sleep(min(2.0 * (2 ** attempt), 30.0))
             attempt += 1
             if auth:
-                headers.update(self.signer.headers("POST", httpx.URL(url).path, body=body, include_body=True))
+                headers.update(self.signer.headers("POST", httpx.URL(url).path))
         if resp.status_code >= 400:
             raise PolymarketAPIError(resp.status_code, url, resp.text)
         return resp.json() if resp.content else None
@@ -221,15 +220,17 @@ class RestClient:
         )
 
     # --- order placement (writes; used only by the gated trading layer) ---------
+    # Verified live: single-order routes are SINGULAR (/order, /order/preview)
+    # and the order is wrapped in a {"request": ...} envelope.
     def preview_order(self, order: dict[str, Any]) -> Any:
         """Validate an order without placing it — safe POST to confirm signing."""
-        return self.post("/orders/preview", order)
+        return self.post("/order/preview", {"request": order})
 
     def create_order(self, order: dict[str, Any]) -> Any:
-        return self.post("/orders", order)
+        return self.post("/order", {"request": order})
 
     def cancel_order(self, order_id: str) -> Any:
-        return self.post("/orders/cancel", {"orderId": order_id})
+        return self.post("/order/cancel", {"request": {"orderId": order_id}})
 
     def iter_activities(self, *, max_pages: int = 2, page_pause: float = 0.4, **kw: Any) -> Any:
         """Yield activity records across pages (handles cursor pagination).

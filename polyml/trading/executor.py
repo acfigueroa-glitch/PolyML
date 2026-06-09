@@ -122,8 +122,12 @@ class Executor:
         if price is None:
             return None
 
-        if self.live and not self._place_live(slug, action.side, price, "entry"):
-            return None  # live order didn't fill; stay flat
+        if self.live:
+            filled, fill_px = self._place_live(slug, action.side, price, "entry")
+            if not filled:
+                return None  # live order didn't fill; stay flat
+            if fill_px is not None:
+                price = fill_px  # record the real fill, not the requested price
 
         cost = entry_cost_basis(price, action.shares, self.config.theta)
         fee = taker_fee(price, action.shares, self.config.theta)
@@ -149,8 +153,12 @@ class Executor:
         if price is None:
             return None
 
-        if self.live and not self._place_live(slug, action.side, price, "exit"):
-            return None  # couldn't exit; keep the position and retry next tick
+        if self.live:
+            filled, fill_px = self._place_live(slug, action.side, price, "exit")
+            if not filled:
+                return None  # couldn't exit; keep the position and retry next tick
+            if fill_px is not None:
+                price = fill_px
 
         proceeds = exit_proceeds(price, pos.shares, self.config.theta)
         fee = taker_fee(price, pos.shares, self.config.theta)
@@ -188,8 +196,14 @@ class Executor:
         )
 
     # --- live order placement ----------------------------------------------------
-    def _place_live(self, slug: str, intent: str | None, price: float, action: str) -> bool:
-        """Place a real one-share IOC order. Returns True if it (likely) filled."""
+    def _place_live(
+        self, slug: str, intent: str | None, price: float, action: str
+    ) -> tuple[bool, float | None]:
+        """Place a real one-share IOC order.
+
+        Returns ``(filled, fill_price)``. With IOC the order either crosses and
+        fills now or is cancelled, so a missing/zero fill means stay/keep flat.
+        """
         order = {
             "marketSlug": slug,
             "intent": intent,
@@ -202,12 +216,17 @@ class Executor:
             resp = self.rest.create_order(order)  # type: ignore[union-attr]
         except PolymarketAPIError as exc:
             logger.warning("live %s order rejected for %s: %s", action, slug, exc)
-            return False
-        state = (resp or {}).get("order", resp or {}).get("state") if isinstance(resp, dict) else None
-        filled = state in (None, "ORDER_STATE_FILLED", "ORDER_STATE_PARTIALLY_FILLED")
+            return False, None
+        o = resp.get("order", {}) if isinstance(resp, dict) else {}
+        state = o.get("state")
+        cum = _to_float(o.get("cumQuantity"))
+        avg = _to_float((o.get("avgPx") or {}).get("value") if isinstance(o.get("avgPx"), dict) else None)
+        filled = state == "ORDER_STATE_FILLED" or cum > 0
         if not filled:
-            logger.info("live %s order for %s did not fill (state=%s)", action, slug, state)
-        return filled
+            logger.info("live %s order for %s did not fill (state=%s, cum=%s)", action, slug, state, cum)
+            return False, None
+        logger.warning("[LIVE] %s FILLED %s 1@%.4f (state=%s)", action, slug, avg or price, state)
+        return True, (avg if avg > 0 else None)
 
     # --- end of session ----------------------------------------------------------
     def force_flatten(
@@ -234,3 +253,10 @@ class Executor:
     def reset_day(self) -> None:
         self.realized_today = 0.0
         self.halted = False
+
+
+def _to_float(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0

@@ -147,6 +147,49 @@ def cmd_report(config, args) -> int:
     return 0
 
 
+def cmd_trade(config, args) -> int:
+    """Run the autonomous one-share scalping engine (paper by default)."""
+    from polyml.trading.engine import TradeEngine
+
+    # CLI flags override config for this run.
+    overrides: dict[str, Any] = {}
+    if args.live:
+        overrides.setdefault("trading", {})["mode"] = "live"
+    if args.market:
+        overrides.setdefault("trading", {})["market_slugs"] = args.market
+    if overrides:
+        config = load_config(overrides)
+
+    try:
+        engine = TradeEngine(config)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if engine.executor.mode == "live":
+        print("\n*** LIVE TRADING IS ACTIVE — the bot will place real one-share orders. ***\n",
+              file=sys.stderr)
+    else:
+        print("Running in PAPER mode (no real orders). Use --live + POLYML_ALLOW_LIVE_TRADING=yes "
+              "to trade for real.", file=sys.stderr)
+
+    async def _main() -> None:
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:  # pragma: no cover
+                pass
+        run_task = asyncio.create_task(engine.run())
+        await stop.wait()
+        await engine.shutdown()
+        run_task.cancel()
+
+    asyncio.run(_main())
+    return 0
+
+
 def cmd_backfill(config, args) -> int:
     """Pull settled history, build sessions for resolved markets, analyze, train."""
     from polyml.api.auth import Ed25519Signer
@@ -255,6 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_backfill = sub.add_parser("backfill", help="Pull settled history and analyze resolved markets")
     p_backfill.add_argument("--pages", type=int, default=20, help="Max activity pages to fetch")
+
+    p_trade = sub.add_parser("trade", help="Run the autonomous one-share scalping bot (paper by default)")
+    p_trade.add_argument("--live", action="store_true",
+                         help="Trade for real (also needs POLYML_ALLOW_LIVE_TRADING=yes)")
+    p_trade.add_argument("--market", action="append", help="Game slug to trade (repeatable)")
     return parser
 
 
@@ -278,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_discover(config)
     if args.command == "backfill":
         return cmd_backfill(config, args)
+    if args.command == "trade":
+        return cmd_trade(config, args)
     parser.error(f"unknown command: {args.command}")
     return 1
 

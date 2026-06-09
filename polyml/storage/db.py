@@ -176,6 +176,47 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS ix_decisions_session ON decisions(session_id);
 
+-- Every order the bot places (entry or exit), paper or live. An audit trail.
+CREATE TABLE IF NOT EXISTS bot_orders (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    INTEGER REFERENCES sessions(id),
+    market_slug   TEXT NOT NULL,
+    mode          TEXT NOT NULL,           -- 'paper' | 'live'
+    action        TEXT NOT NULL,           -- entry | exit
+    side          TEXT,                    -- ORDER_INTENT_*
+    price         REAL,
+    shares        REAL,
+    fee           REAL,
+    status        TEXT,                    -- filled | rejected | submitted
+    external_id   TEXT,                    -- live order id, if any
+    reason        TEXT,
+    created_at    TEXT NOT NULL,
+    raw           TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_bot_orders_slug ON bot_orders(market_slug, created_at);
+
+-- Completed round-trips (entry + exit) — the unit the bot learns from.
+CREATE TABLE IF NOT EXISTS bot_trades (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     INTEGER REFERENCES sessions(id),
+    market_slug    TEXT NOT NULL,
+    mode           TEXT NOT NULL,
+    side           TEXT,
+    shares         REAL,
+    entry_price    REAL,
+    entry_cost     REAL,
+    exit_price     REAL,
+    exit_proceeds  REAL,
+    net_pnl        REAL,
+    entry_time     TEXT,
+    exit_time      TEXT,
+    exit_reason    TEXT,
+    features       TEXT,                   -- JSON: market state at entry
+    label_good     INTEGER,                -- 1 if net_pnl > 0 else 0
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_bot_trades_session ON bot_trades(session_id);
+
 -- Each model training run, with metrics + feature importances.
 CREATE TABLE IF NOT EXISTS learning_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -385,6 +426,45 @@ class Database:
             "created_at": now_iso(),
         }
         return self._insert_or_ignore("decisions", row)
+
+    def insert_bot_order(self, **kw: Any) -> int:
+        row = {
+            "session_id": kw.get("session_id"),
+            "market_slug": kw.get("market_slug"),
+            "mode": kw.get("mode", "paper"),
+            "action": kw.get("action"),
+            "side": kw.get("side"),
+            "price": kw.get("price"),
+            "shares": kw.get("shares"),
+            "fee": kw.get("fee"),
+            "status": kw.get("status"),
+            "external_id": kw.get("external_id"),
+            "reason": kw.get("reason"),
+            "created_at": now_iso(),
+            "raw": self._dump(kw.get("raw")) if kw.get("raw") is not None else None,
+        }
+        return self._insert("bot_orders", row)
+
+    def insert_bot_trade(self, **kw: Any) -> int:
+        row = {
+            "session_id": kw.get("session_id"),
+            "market_slug": kw.get("market_slug"),
+            "mode": kw.get("mode", "paper"),
+            "side": kw.get("side"),
+            "shares": kw.get("shares"),
+            "entry_price": kw.get("entry_price"),
+            "entry_cost": kw.get("entry_cost"),
+            "exit_price": kw.get("exit_price"),
+            "exit_proceeds": kw.get("exit_proceeds"),
+            "net_pnl": kw.get("net_pnl"),
+            "entry_time": kw.get("entry_time"),
+            "exit_time": kw.get("exit_time"),
+            "exit_reason": kw.get("exit_reason"),
+            "features": self._dump(kw.get("features", {})),
+            "label_good": kw.get("label_good"),
+            "created_at": now_iso(),
+        }
+        return self._insert("bot_trades", row)
 
     def insert_learning_run(self, model, n_decisions, metrics, feature_importances, notes) -> int:
         return self._insert(

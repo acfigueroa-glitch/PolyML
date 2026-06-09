@@ -40,6 +40,39 @@ sessions:
   # finalize the session even if we missed the resolution event.
   stale_close_minutes: 120
 
+trading:
+  # SAFETY: 'paper' simulates fills against the live book and places NO real
+  # orders. 'live' places real one-share orders and additionally requires the
+  # env var POLYML_ALLOW_LIVE_TRADING=yes, or it falls back to paper.
+  mode: "paper"
+
+  # Which games to trade. Empty -> auto-discover a few currently-open markets.
+  market_slugs: []
+  discover_limit: 20
+  max_games: 5
+
+  # Strategy: buy 1 share, leave with ANY profit above the hurdle, never chase.
+  profit_hurdle_usd: 0.01        # minimum net profit (after round-trip fee) to exit
+  max_spread: 0.05               # skip entries when the spread is wider than this
+  min_price: 0.05                # avoid the extreme tails
+  max_price: 0.95
+  max_target_move: 0.08          # only enter if a profitable exit is within reach
+  entry_imbalance_min: 0.10      # require some buy pressure to enter
+
+  # Risk caps.
+  shares_per_trade: 1            # fixed; the bot buys one share at a time
+  max_open_positions: 1
+  stop_loss_usd: 0.10            # cut a loser; set null to disable (risky)
+  daily_loss_limit_usd: 2.0      # halt new entries past this realized daily loss
+  flatten_before_close: true     # exit before resolution rather than ride to 0/1
+  close_buffer_minutes: 5
+
+  # Learning gate: once the bot has enough of its own round-trips, only enter
+  # when the learner's P(good) clears the threshold.
+  use_model_gate: true
+  model_threshold: 0.50
+  min_trades_to_train: 20
+
 learning:
   # Minimum number of labelled decisions before we train a model.
   min_decisions_to_train: 30

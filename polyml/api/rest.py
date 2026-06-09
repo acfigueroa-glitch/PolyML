@@ -21,6 +21,7 @@ PolyML is observe-only and never places, modifies, or cancels orders.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -134,6 +135,35 @@ class RestClient:
     def get(self, path: str, **kw: Any) -> Any:
         return self._request("GET", path, **kw)
 
+    def post(self, path: str, body_obj: Any, *, auth: bool = True) -> Any:
+        """Signed POST with a JSON body. Used only by the trading layer.
+
+        The signed message for writes is ``"{ts}POST{path}{body}"`` — the body is
+        folded in so it can't be tampered with. ``preview_order`` is the safe way
+        to confirm POST signing works before placing a real order.
+        """
+        body = json.dumps(body_obj, separators=(",", ":")) if body_obj is not None else ""
+        url = f"{self.rest_base_url}{path}"
+        headers: dict[str, str] = {"Accept": "application/json", "Content-Type": "application/json"}
+        if auth:
+            if self.signer is None:
+                raise PolymarketAPIError(401, url, "Authenticated call requires credentials")
+            sign_path = httpx.URL(url).path
+            headers.update(self.signer.headers("POST", sign_path, body=body, include_body=True))
+
+        attempt = 0
+        while True:
+            resp = self._client.request("POST", url, headers=headers, content=body)
+            if resp.status_code not in (429, 503) or attempt >= self.max_retries:
+                break
+            time.sleep(min(2.0 * (2 ** attempt), 30.0))
+            attempt += 1
+            if auth:
+                headers.update(self.signer.headers("POST", httpx.URL(url).path, body=body, include_body=True))
+        if resp.status_code >= 400:
+            raise PolymarketAPIError(resp.status_code, url, resp.text)
+        return resp.json() if resp.content else None
+
     # --- market data (all endpoints on the api host require auth headers) --------
     def list_markets(self, limit: int = 50, cursor: str | None = None) -> Any:
         return self.get("/markets", params={"limit": limit, "cursor": cursor}, auth=True)
@@ -181,6 +211,17 @@ class RestClient:
                 "sortOrder": sort_order,
             },
         )
+
+    # --- order placement (writes; used only by the gated trading layer) ---------
+    def preview_order(self, order: dict[str, Any]) -> Any:
+        """Validate an order without placing it — safe POST to confirm signing."""
+        return self.post("/orders/preview", order)
+
+    def create_order(self, order: dict[str, Any]) -> Any:
+        return self.post("/orders", order)
+
+    def cancel_order(self, order_id: str) -> Any:
+        return self.post("/orders/cancel", {"orderId": order_id})
 
     def iter_activities(self, *, max_pages: int = 2, page_pause: float = 0.4, **kw: Any) -> Any:
         """Yield activity records across pages (handles cursor pagination).

@@ -103,6 +103,7 @@ a session per market, and analyzes each one when it resolves.
 | `polyml discover` | List markets you're involved in and available markets. |
 | `polyml analyze [--slug S] [--all]` | Link decisions to outcomes for concluded sessions. |
 | `polyml report [--slug S \| --session N]` | Print a session's analysis: decisions, lessons, counterfactuals. |
+| `polyml trade [--live] [--market S]` | Run the autonomous one-share scalping bot. **Paper by default.** |
 | `polyml train` | Train the learner on all accumulated decisions. |
 
 > **Note on `backfill` vs `run`.** Backfill reconstructs sessions from your
@@ -137,6 +138,61 @@ to transparent feature/outcome correlations instead of pretending to have a mode
 > insight and never acts on it.
 
 ---
+
+## Autonomous trading (one-share scalper)
+
+`polyml trade` runs a bot that buys **one share at a time** and scalps for **any**
+net profit — it never chases a bigger one. Per game it:
+
+1. On each order-book update, builds features, asks the learner for a P(good)
+   entry score, and runs the scalp strategy.
+2. **Enters** (buys 1 share at the ask) only when a profitable exit is actually
+   reachable after the dynamic round-trip fee and spread, the book can absorb the
+   exit, and the entry passes the buy-pressure / learner gate.
+3. **Exits** (sells 1 share at the bid) the moment the round-trip net profit
+   clears the hurdle — *any* profit. Optionally cuts losses (stop-loss) and
+   flattens before the market resolves rather than riding to a 0/1 settlement.
+4. When the **game ends**, it flattens, **self-analyzes its own trades** (good =
+   profit, bad = loss), retrains on its accumulated round-trips, and moves to the
+   next game a little smarter.
+
+### The fee-aware math
+
+Polymarket's taker fee is dynamic — `fee(p, N) = θ·N·p·(1−p)` — peaking at p = 0.50
+and tapering to zero at the tails. Selling N at price p nets
+`(1−θ)·N·p + θ·N·p²`, so the **breakeven exit** solves the quadratic
+
+```
+θ·p² + (1−θ)·p − C/N = 0        (a = θ ≈ 0.05, b = 1−θ ≈ 0.95, c = −C/N)
+```
+
+where C is the entry cost basis (notional + entry fee). The exit only triggers
+when **net profit > target hurdle** *and* the book has depth at the exit price.
+This is all in `polyml/trading/fees.py` (rigorously unit-tested).
+
+### Safety — live trading is double-opt-in
+
+> ⚠️ Autonomous trading risks real money. The default is **PAPER** mode, which
+> simulates fills against the live book and places **no orders**.
+
+Live trading requires **both**:
+
+```bash
+# 1) config:  trading.mode: live      (or the --live flag)
+# 2) env:     POLYML_ALLOW_LIVE_TRADING=yes
+POLYML_ALLOW_LIVE_TRADING=yes polyml trade --live --market <game-slug>
+```
+
+If either is missing, the bot refuses and runs in paper mode. Hard caps always
+apply: **one share per order**, a max number of concurrent positions, and a
+**daily realized-loss kill switch** that halts new entries.
+
+> **Honest caveat on the strategy.** "Take any profit, never chase" collects many
+> tiny wins but is exposed on the downside: a stalled position that rides to a 0
+> settlement can erase many winners (your own settled history showed exactly this
+> pattern). That's why the stop-loss and flatten-before-close guards are **on by
+> default** — disabling them (`stop_loss_usd: null`, `flatten_before_close: false`)
+> is materially riskier. Validate in paper mode before ever going live.
 
 ## Configuration
 
@@ -174,7 +230,8 @@ polyml/
   mirror/      activity_mirror.py
   session/     manager.py
   analysis/    features.py · outcomes.py · learner.py
-  runner.py    orchestrates the live async loop
+  trading/     fees.py · strategy.py · executor.py · engine.py
+  runner.py    orchestrates the live observe-only async loop
   cli.py       command-line entrypoint
 scripts/
   seed_demo.py end-to-end demo with no credentials

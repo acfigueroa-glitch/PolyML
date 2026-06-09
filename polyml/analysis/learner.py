@@ -67,20 +67,22 @@ class Learner:
         self._feature_builder = FeatureBuilder(db)
 
     # --- data --------------------------------------------------------------------
-    def _load_dataset(self) -> tuple[np.ndarray, np.ndarray]:
+    def _load_dataset(self, source: str = "decisions") -> tuple[np.ndarray, np.ndarray]:
+        # 'decisions' = your mirrored trades; 'bot' = the bot's own round-trips.
+        table = "bot_trades" if source == "bot" else "decisions"
         rows = self.db.query(
-            "SELECT features, label_good FROM decisions WHERE label_good IS NOT NULL"
+            f"SELECT features, label_good FROM {table} WHERE label_good IS NOT NULL"
         )
         X, y = [], []
         for row in rows:
-            feats = json.loads(row["features"])
+            feats = json.loads(row["features"]) if row["features"] else {}
             X.append([float(feats.get(name, 0.0)) for name in FEATURE_NAMES])
             y.append(int(row["label_good"]))
         return np.array(X, dtype=float), np.array(y, dtype=int)
 
     # --- training ----------------------------------------------------------------
-    def train(self) -> LearningResult:
-        X, y = self._load_dataset()
+    def train(self, source: str = "decisions") -> LearningResult:
+        X, y = self._load_dataset(source)
         n = len(y)
         if n < self.min_decisions or len(set(y.tolist())) < 2:
             result = self._heuristic_result(X, y, n)

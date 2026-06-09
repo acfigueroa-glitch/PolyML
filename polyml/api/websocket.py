@@ -75,6 +75,15 @@ class _BaseWebSocket:
         """Queue a subscribe message; (re)sent on every (re)connect."""
         self._subscriptions.append(message)
 
+    async def send_subscription(self, message: dict[str, Any]) -> None:
+        """Add a subscription and send it now if the socket is connected."""
+        self._subscriptions.append(message)
+        if self._ws is not None:
+            try:
+                await self._send(self._ws, message)
+            except Exception:  # noqa: BLE001 - it will be re-sent on reconnect
+                logger.debug("[%s] live subscribe failed; will resend on reconnect", self.name)
+
     def _auth_headers(self) -> list[tuple[str, str]]:
         if self.signer is None:
             return []

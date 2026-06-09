@@ -51,6 +51,24 @@ def test_engine_enters_then_exits_and_self_analyzes(engine):
     assert "learning" in report
 
 
+def test_terminal_book_state_finalizes_and_settles(engine):
+    # Open a position on a live book.
+    engine.on_book("g1", _book(0.49, 300, 0.50, 80))
+    assert engine.executor.has_position("g1")
+
+    # Next book arrives with the market resolved (terminal state, no bid).
+    resolved = OrderBook.from_payload(
+        {"marketData": {"marketSlug": "g1", "state": "MARKET_STATE_EXPIRED",
+                        "bids": [], "offers": [],
+                        "stats": {"lastTradePx": {"value": "1.0"}}}}
+    )
+    engine.on_book("g1", resolved)
+    # Game finalized: position settled, no further trading, idempotent.
+    assert not engine.executor.has_position("g1")
+    assert "g1" in engine._finalized
+    assert engine.db.query_one("SELECT COUNT(*) AS n FROM bot_trades")["n"] == 1
+
+
 def test_engine_flattens_open_position_at_game_end(engine):
     engine.on_book("g1", _book(0.49, 300, 0.50, 80))
     assert engine.executor.has_position("g1")

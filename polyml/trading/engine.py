@@ -27,6 +27,7 @@ from polyml.api.websocket import MarketsWebSocket, PrivateWebSocket
 from polyml.config import Config
 from polyml.mirror import ActivityMirror, ActivityPoller
 from polyml.session import SessionManager
+from polyml.session.manager import TERMINAL_STATES
 from polyml.storage.db import Database
 from polyml.storage.models import OrderBook
 from polyml.trading.executor import Executor, ExecutorConfig
@@ -63,6 +64,7 @@ class TradeEngine:
             holdout_fraction=config.get("learning.holdout_fraction", 0.25),
         )
         self._trained = False
+        self._finalized: set[str] = set()
         self.watchlist: set[str] = set(config.get("trading.market_slugs", []) or [])
         self.markets_ws = MarketsWebSocket(config.ws_markets_url, self.signer, self._on_market_message)
         self.mirror = ActivityMirror(self.db)
@@ -102,6 +104,12 @@ class TradeEngine:
     # --- per-tick logic (testable) ----------------------------------------------
     def on_book(self, slug: str, book: OrderBook, minutes_to_close: float | None = None) -> Any:
         """Run the strategy for one book update and execute the resulting action."""
+        # If the market has resolved, the game is over: finalize instead of trading.
+        if book.state in TERMINAL_STATES:
+            self.finalize_game(slug, book=book)
+            return None
+        if slug in self._finalized:
+            return None
         position = self.executor.position(slug)
         features = self.features.build(
             slug, _now_iso(), decision_price=book.best_ask if position is None else book.best_bid
@@ -124,8 +132,14 @@ class TradeEngine:
     # --- end of game (testable) --------------------------------------------------
     def finalize_game(self, slug: str, book: OrderBook | None = None) -> dict[str, Any]:
         """Flatten, self-analyze the bot's trades for this game, learn, continue."""
-        if book is not None:
-            self.executor.force_flatten(slug, book, reason="game over — flatten")
+        if slug in self._finalized:
+            return self._self_analysis(slug)
+        self._finalized.add(slug)
+        if self.executor.has_position(slug):
+            # Settle the open position: prefer a live bid, else the resolved value
+            # / last known mid (a game-over book often has no bid).
+            settle = self._settlement_price(slug, book)
+            self.executor.force_flatten(slug, book=book, price=settle, reason="game over — settle")
         report = self._self_analysis(slug)
         # Learn from the bot's own round-trips so the next game starts smarter.
         result = self.learner.train(source="bot")
@@ -139,6 +153,22 @@ class TradeEngine:
             logger.info("  lesson: %s", lesson)
         self.watchlist.discard(slug)
         return report
+
+    def _settlement_price(self, slug: str, book: OrderBook | None) -> float | None:
+        if book is not None and book.best_bid is not None:
+            return book.best_bid
+        o = self.db.query_one("SELECT resolved_value FROM outcomes WHERE market_slug=?", (slug,))
+        if o and o["resolved_value"] is not None:
+            return float(o["resolved_value"])
+        if book is not None and book.last_trade_px is not None:
+            return book.last_trade_px
+        b = self.db.query_one(
+            "SELECT mid, last_trade_px FROM book_snapshots WHERE market_slug=? "
+            "AND mid IS NOT NULL ORDER BY captured_at DESC LIMIT 1", (slug,)
+        )
+        if b:
+            return b["mid"] if b["mid"] is not None else b["last_trade_px"]
+        return None
 
     def _self_analysis(self, slug: str) -> dict[str, Any]:
         rows = self.db.query(
@@ -232,6 +262,7 @@ class TradeEngine:
             asyncio.create_task(self.markets_ws.run(), name="markets-ws"),
             asyncio.create_task(self.private_ws.run(), name="private-ws"),
             asyncio.create_task(self.activity_poller.run(), name="activities"),
+            asyncio.create_task(self._monitor_loop(), name="monitor"),
         ]
         try:
             await asyncio.gather(*self._tasks)
@@ -245,12 +276,66 @@ class TradeEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("game discovery failed: %s", exc)
             return
+        max_games = self.config.get("trading.max_games", 5)
         for m in markets.get("markets", []):
-            slug, state = m.get("slug"), m.get("state")
-            if slug and state in (None, "MARKET_STATE_OPEN", "OPEN"):
-                self.watchlist.add(slug)
-                if len(self.watchlist) >= self.config.get("trading.max_games", 5):
-                    break
+            slug = m.get("slug")
+            if not slug or slug in self.watchlist or slug in self._finalized:
+                continue
+            if self._is_resolved(m):
+                continue
+            self.watchlist.add(slug)
+            if len(self.watchlist) >= max_games:
+                break
+
+    @staticmethod
+    def _is_resolved(market: dict) -> bool:
+        if market.get("state") in TERMINAL_STATES:
+            return True
+        if market.get("closed") is True or market.get("archived") is True:
+            return True
+        return market.get("ep3Status") == "EXPIRED"
+
+    # --- monitor: detect game-over and bring in the next game --------------------
+    async def _monitor_loop(self) -> None:
+        interval = self.config.get("trading.monitor_interval", 25)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await asyncio.to_thread(self._poll_market_states)
+                await self._top_up_games()
+            except Exception:  # noqa: BLE001
+                logger.exception("monitor loop error")
+
+    def _poll_market_states(self) -> None:
+        for slug in list(self.watchlist):
+            try:
+                payload = self.rest.get_market(slug)
+            except Exception:  # noqa: BLE001
+                continue
+            if not payload:
+                continue
+            market = payload.get("market", payload)
+            self.db.insert_market_snapshot(
+                slug, market.get("title") or market.get("question"), market.get("state"), payload
+            )
+            if self._is_resolved(market):
+                logger.info("[%s] market resolved — finalizing game", slug)
+                self.finalize_game(slug)
+
+    async def _top_up_games(self) -> None:
+        target = self.config.get("trading.max_games", 5)
+        if len(self.watchlist) >= target:
+            return
+        before = set(self.watchlist)
+        await asyncio.to_thread(self._discover_games)
+        for slug in self.watchlist - before:
+            self.session_manager.open_session(slug)
+            await self.markets_ws.send_subscription(
+                {"subscribe": {"requestId": f"md-{slug}",
+                               "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+                               "marketSlugs": [slug]}}
+            )
+            logger.info("now trading new game: %s", slug)
 
     async def shutdown(self) -> None:
         logger.info("TradeEngine shutting down...")

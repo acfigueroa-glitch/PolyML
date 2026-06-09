@@ -210,12 +210,25 @@ class Executor:
         return filled
 
     # --- end of session ----------------------------------------------------------
-    def force_flatten(self, slug: str, book: OrderBook, reason: str = "session end") -> _Trade | None:
-        """Close any open position at the current bid (used when a game ends)."""
+    def force_flatten(
+        self,
+        slug: str,
+        book: OrderBook | None = None,
+        *,
+        price: float | None = None,
+        reason: str = "session end",
+    ) -> _Trade | None:
+        """Close any open position when a game ends.
+
+        Uses ``price`` if given (e.g. the settlement value), else the current
+        best bid. Returns None if there is nothing to close or no price.
+        """
         if slug not in self.positions:
             return None
-        bid = book.best_bid
-        action = Action(EXIT, reason, side=self.positions[slug].side, price=bid, shares=1.0)
+        fill = price if price is not None else (book.best_bid if book else None)
+        if fill is None:
+            return None
+        action = Action(EXIT, reason, side=self.positions[slug].side, price=fill, shares=1.0)
         return self._close(action, book, slug)
 
     def reset_day(self) -> None:

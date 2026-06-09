@@ -48,6 +48,21 @@ learning:
   holdout_fraction: 0.25
   random_state: 42
 
+trading:
+  # Paper trading simulates the model's decisions with fee-aware fills and
+  # records P&L — it places NO real orders. This is how we prove (or disprove)
+  # an edge before risking money. Safe to leave running.
+  paper_enabled: false           # run the paper trader inside `polyml run`
+  paper_interval: 15             # seconds between paper-trading ticks (live mode)
+  max_contracts_per_order: 1     # hard cap on simulated order size
+  # Only "trade" when expected value per contract (model_prob - price - fee)
+  # clears this threshold. Higher = more selective.
+  min_edge: 0.02
+  # LIVE order placement. Intentionally hard-off: no order-placement code path
+  # exists, and none runs until this is deliberately enabled after paper P&L
+  # (net of fees) is convincingly positive.
+  live_enabled: false
+
 logging:
   level: "INFO"
   file: "logs/polyml.log"

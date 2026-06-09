@@ -231,6 +231,39 @@ def cmd_train(config) -> int:
     return 0
 
 
+def cmd_paper(config, args) -> int:
+    """Backtest the model's decisions over collected book history — fee-aware,
+    no real orders. Proves (or disproves) an edge before any live trading."""
+    from polyml.trading.backtest import run_backtest
+
+    db = Database(config.db_path)
+    learner = _make_learner(config, db)
+    result = learner.train()  # fit the in-memory model from stored decisions
+    print(result.summary())
+    if not result.trained:
+        print("\nModel is not trained (or has no edge yet) — the paper trader has "
+              "nothing to act on. Collect more live sessions with `polyml run`.")
+    min_edge = args.min_edge if args.min_edge is not None else config.get("trading.min_edge", 0.02)
+    fee_rate = config.get("trading.fee_rate", 0.05)
+    summary = run_backtest(db, learner.score_decision, min_edge=min_edge, fee_rate=fee_rate)
+    print("\n=== Paper trading backtest (simulated, NO real orders) ===")
+    print(f"markets with book history: {summary['markets_with_book']}  |  min_edge={min_edge}")
+    if summary["settled"] == 0:
+        print("No paper trades taken. Either the model saw no edge above fees, or "
+              "there is no order-book history yet (backfill alone doesn't collect it).")
+    else:
+        wr = summary["win_rate"]
+        print(f"trades: {summary['settled']}  wins: {summary['wins']} "
+              f"({wr*100:.0f}%)" if wr is not None else f"trades: {summary['settled']}")
+        print(f"gross P&L: ${summary['gross_pnl']:+.2f}   fees: ${summary['fees']:.2f}   "
+              f"NET P&L: ${summary['net_pnl']:+.2f}")
+        print(f"avg edge at entry: {summary['avg_edge']:+.4f}")
+        print("\nNet positive after fees, sustained over many markets, is the bar "
+              "to clear before considering any live order placement.")
+    db.close()
+    return 0
+
+
 def cmd_discover(config) -> int:
     from polyml.api.auth import Ed25519Signer
     from polyml.api.rest import RestClient
@@ -288,6 +321,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("train", help="Train the learner on accumulated decisions")
     sub.add_parser("discover", help="List markets you're involved in and available markets")
 
+    p_paper = sub.add_parser(
+        "paper", help="Backtest the model's decisions on collected data (no real orders)"
+    )
+    p_paper.add_argument("--min-edge", type=float, default=None,
+                         help="Min expected value/contract to 'trade' (default from config)")
+
     p_backfill = sub.add_parser("backfill", help="Pull settled history and analyze resolved markets")
     p_backfill.add_argument("--pages", type=int, default=20, help="Max activity pages to fetch")
     return parser
@@ -309,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_report(config, args)
     if args.command == "train":
         return cmd_train(config)
+    if args.command == "paper":
+        return cmd_paper(config, args)
     if args.command == "discover":
         return cmd_discover(config)
     if args.command == "backfill":

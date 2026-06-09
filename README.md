@@ -104,6 +104,7 @@ a session per market, and analyzes each one when it resolves.
 | `polyml analyze [--slug S] [--all]` | Link decisions to outcomes for concluded sessions. |
 | `polyml report [--slug S \| --session N]` | Print a session's analysis: decisions, lessons, counterfactuals. |
 | `polyml train` | Train the learner on all accumulated decisions. |
+| `polyml paper [--min-edge X]` | **Paper-trade** the learned model over collected book history — fee-aware, **no real orders**. Proof of edge. |
 
 > **Note on `backfill` vs `run`.** Backfill reconstructs sessions from your
 > settled trade history, so it gives you **real labels, PnL, and counterfactuals**
@@ -148,6 +149,37 @@ from the environment (`.env`) and are never read from YAML.
 
 Environment overrides: `POLYMARKET_KEY_ID`, `POLYMARKET_SECRET_KEY`,
 `POLYML_DB_PATH`, `POLYML_REST_BASE_URL`, `POLYML_LOG_LEVEL`, …
+
+---
+
+## Paper trading (proving an edge before risking money)
+
+PolyML can **simulate** what the learned model would trade — with real fees, but
+**zero real orders** — so you can see whether the strategy actually makes money
+before anything touches the market.
+
+The rule is deliberately simple and principled: for a one-contract long buy at
+price `p_ask`, the model's `P(good)` is the win probability, so the expected
+value per contract is `EV = P(good) − p_ask − fee`. It "buys" one contract only
+when `EV ≥ min_edge`, holds to resolution, and books P&L net of the taker fee.
+That makes the [fee model](polyml/fees.py) a first-class input: the question it
+answers is *"does the edge survive the fees?"*
+
+```bash
+polyml paper                 # backtest over collected book history (no orders)
+polyml paper --min-edge 0.05 # be more selective
+```
+
+Or watch it live while you trade — set `trading.paper_enabled: true` in
+`config/local.yaml` and run `polyml run`; it logs each simulated buy and settles
+them as markets resolve, writing to the `paper_positions` ledger.
+
+> ⚠️ **Still observe-only.** Paper trading places no orders. There is no
+> order-placement code path, and `trading.live_enabled` is a hard-off placeholder.
+> The bar before *any* live trading is considered: paper P&L **net of fees**
+> convincingly positive across many markets, with out-of-sample model AUC well
+> above 0.5. Today the model trains to ~0.50 AUC (chance) until `polyml run` has
+> collected enough live order-book history — so there is no edge to trade yet.
 
 ---
 

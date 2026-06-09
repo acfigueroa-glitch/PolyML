@@ -1,0 +1,53 @@
+# PolyML default configuration.
+# Copy to config/local.yaml and edit, or override via env vars / CLI flags.
+# Anything here can be overridden by environment variables (see polyml/config.py).
+
+api:
+  rest_base_url: "https://api.polymarket.us/v1"
+  gateway_base_url: "https://gateway.polymarket.us/v1"
+  ws_private_url: "wss://api.polymarket.us/v1/ws/private"
+  ws_markets_url: "wss://api.polymarket.us/v1/ws/markets"
+  timeout_seconds: 30.0
+  # Signature timestamps must be within 30s of server time.
+  max_clock_skew_seconds: 25
+
+storage:
+  db_path: "data/polyml.db"
+
+# Markets to actively watch. Leave empty to auto-discover the markets you hold
+# positions in / have open orders on. Slugs come from the markets endpoint.
+watch:
+  market_slugs: []
+  auto_follow_my_positions: true   # also watch any market you hold/trade
+  discover_limit: 50               # how many markets to scan when auto-discovering
+
+collectors:
+  # How often (seconds) to snapshot REST data. The WebSocket feeds give
+  # real-time updates; these polls are a safety net and fill gaps.
+  market_book_interval: 5
+  account_interval: 15
+  open_orders_interval: 10
+  activities_interval: 30
+  # Prefer streaming over polling when a WebSocket connection is healthy.
+  use_websockets: true
+
+sessions:
+  # A "trading session" is grouped per market. It is considered concluded when
+  # the market resolves/settles (state TERMINATED/EXPIRED or a POSITION_RESOLUTION
+  # activity arrives). After conclusion we run outcome linkage + learning.
+  auto_analyze_on_close: true
+  # If a watched market has had no activity for this long and is resolved,
+  # finalize the session even if we missed the resolution event.
+  stale_close_minutes: 120
+
+learning:
+  # Minimum number of labelled decisions before we train a model.
+  min_decisions_to_train: 30
+  model: "gradient_boosting"   # one of: gradient_boosting, logistic, heuristic
+  # Fraction of recent decisions held out to report honest performance.
+  holdout_fraction: 0.25
+  random_state: 42
+
+logging:
+  level: "INFO"
+  file: "logs/polyml.log"

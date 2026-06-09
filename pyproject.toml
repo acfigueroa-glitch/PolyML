@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polyml"
+version = "0.1.0"
+description = "A machine-learning trading companion for Polymarket US that observes markets and mirrors your own trading activity to learn from outcomes. Observe-only: it never trades on your behalf."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "PolyML" }]
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "cryptography>=41.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4", "mypy>=1.8"]
+
+[project.scripts]
+polyml = "polyml.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["polyml*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

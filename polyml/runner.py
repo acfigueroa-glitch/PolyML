@@ -90,6 +90,25 @@ class Runner:
         self.markets_ws = MarketsWebSocket(config.ws_markets_url, self.signer, self._on_market_message)
         self._tasks: list[asyncio.Task] = []
 
+        # Paper trading: simulate the model's decisions live (no real orders).
+        self.paper_enabled = bool(config.get("trading.paper_enabled", False))
+        self.paper_trader = None
+        self.paper_interval = float(config.get("trading.paper_interval", 15))
+        self.paper_fee_rate = float(config.get("trading.fee_rate", 0.05))
+        if self.paper_enabled:
+            from polyml.analysis.features import FeatureBuilder
+            from polyml.trading.paper import PaperStrategy, PaperTrader
+
+            self._feature_builder = FeatureBuilder(self.db)
+            strategy = PaperStrategy(
+                min_edge=config.get("trading.min_edge", 0.02),
+                max_contracts=config.get("trading.max_contracts_per_order", 1),
+                fee_rate=self.paper_fee_rate,
+            )
+            self.paper_trader = PaperTrader(
+                self.db, self.learner.score_decision, strategy=strategy, source="live"
+            )
+
     # --- watchlist management ----------------------------------------------------
     def _follow_market(self, slug: str) -> None:
         if slug and slug not in self.watchlist:
@@ -139,6 +158,13 @@ class Runner:
         logger.info("session %d analysis complete:\n%s", session_id, result.summary())
         for lesson in report.get("lessons", []):
             logger.info("  lesson [%s]: %s", slug, lesson)
+        # Settle any open paper position at the resolved outcome.
+        if self.paper_trader is not None:
+            row = self.db.query_one(
+                "SELECT resolved_value FROM outcomes WHERE market_slug=?", (slug,)
+            )
+            if row and row["resolved_value"] is not None:
+                self.paper_trader.settle(slug, row["resolved_value"])
 
     # --- lifecycle ---------------------------------------------------------------
     async def run(self) -> None:
@@ -158,6 +184,11 @@ class Runner:
         ]
         if self.config.get("collectors.use_websockets", True):
             self._tasks.append(asyncio.create_task(self.markets_ws.run(), name="markets-ws"))
+        if self.paper_trader is not None:
+            # Fit the model from stored decisions so the paper trader can score.
+            await asyncio.to_thread(self.learner.train)
+            self._tasks.append(asyncio.create_task(self._paper_loop(), name="paper"))
+            logger.info("paper trading ENABLED (simulated, no real orders); live trading is off")
 
         logger.info("PolyML running — observing %d market(s). Ctrl-C to stop.", len(self.watchlist))
         try:
@@ -173,6 +204,30 @@ class Runner:
                 await asyncio.to_thread(self.session_manager.sweep_stale, stale_minutes)
             except Exception:  # noqa: BLE001
                 logger.exception("stale sweep failed")
+
+    async def _paper_loop(self) -> None:
+        """Periodically let the paper trader consider each watched market."""
+        while True:
+            await asyncio.sleep(self.paper_interval)
+            for slug in list(self.watchlist):
+                try:
+                    await asyncio.to_thread(self._paper_tick, slug)
+                except Exception:  # noqa: BLE001
+                    logger.exception("paper tick failed for %s", slug)
+
+    def _paper_tick(self, slug: str) -> None:
+        book = self.db.query_one(
+            "SELECT captured_at, best_ask FROM book_snapshots WHERE market_slug=? "
+            "ORDER BY captured_at DESC LIMIT 1",
+            (slug,),
+        )
+        if not book or book["best_ask"] is None:
+            return
+        when = book["captured_at"]
+        feats = self._feature_builder.build(slug, when, decision_price=book["best_ask"])
+        self.paper_trader.consider(
+            slug, feats, best_ask=book["best_ask"], fee_rate=self.paper_fee_rate, opened_at=when
+        )
 
     async def shutdown(self, *, timeout: float = SHUTDOWN_GRACE_SECONDS) -> int:
         """Stop every loop and release resources.

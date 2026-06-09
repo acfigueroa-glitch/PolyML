@@ -36,3 +36,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# User-specific config override
+config/local.yaml

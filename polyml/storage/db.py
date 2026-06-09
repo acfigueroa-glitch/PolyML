@@ -179,6 +179,29 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS ix_decisions_session ON decisions(session_id);
 
+-- Paper-trading positions: simulated 1-contract entries the model decided to
+-- take, held to resolution and settled at the outcome. NO real orders — this is
+-- the fee-aware proof-of-edge ledger. realized_pnl is net of the entry fee.
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_slug    TEXT NOT NULL,
+    instrument     TEXT NOT NULL,          -- 'long' | 'short'
+    qty            REAL NOT NULL,
+    entry_price    REAL NOT NULL,
+    entry_fee      REAL NOT NULL,
+    model_prob     REAL,                   -- P(good) the model assigned
+    edge           REAL,                   -- expected value/contract at entry
+    source         TEXT NOT NULL,          -- 'backtest' | 'live'
+    status         TEXT NOT NULL,          -- 'open' | 'settled'
+    opened_at      TEXT NOT NULL,
+    settled_value  REAL,                   -- instrument settlement (0..1)
+    realized_pnl   REAL,                   -- (settle - entry)*qty - fee
+    settled_at     TEXT,
+    created_at     TEXT NOT NULL,
+    UNIQUE(market_slug, source)            -- at most one paper position per market/run
+);
+CREATE INDEX IF NOT EXISTS ix_paper_positions_status ON paper_positions(status, source);
+
 -- Each model training run, with metrics + feature importances.
 CREATE TABLE IF NOT EXISTS learning_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -417,3 +440,42 @@ class Database:
              "feature_importances": self._dump(feature_importances), "notes": notes,
              "created_at": now_iso()},
         )
+
+    # --- paper trading -----------------------------------------------------------
+    def open_paper_position(self, **kw: Any) -> int | None:
+        """Record a simulated entry. Ignored if one already exists for this
+        market+source (one paper position per market per run)."""
+        return self._insert_or_ignore(
+            "paper_positions",
+            {
+                "market_slug": kw["market_slug"],
+                "instrument": kw.get("instrument", "long"),
+                "qty": kw["qty"],
+                "entry_price": kw["entry_price"],
+                "entry_fee": kw["entry_fee"],
+                "model_prob": kw.get("model_prob"),
+                "edge": kw.get("edge"),
+                "source": kw.get("source", "live"),
+                "status": "open",
+                "opened_at": kw.get("opened_at") or now_iso(),
+                "created_at": now_iso(),
+            },
+        )
+
+    def settle_paper_position(self, market_slug: str, source: str, settled_value: float) -> None:
+        """Settle an open paper position at the instrument's resolved value,
+        booking realized P&L net of the entry fee."""
+        self.execute(
+            """UPDATE paper_positions
+                 SET status='settled', settled_value=?, settled_at=?,
+                     realized_pnl=(? - entry_price) * qty - entry_fee
+               WHERE market_slug=? AND source=? AND status='open'""",
+            (settled_value, now_iso(), settled_value, market_slug, source),
+        )
+
+    def has_open_paper_position(self, market_slug: str, source: str) -> bool:
+        row = self.query_one(
+            "SELECT 1 FROM paper_positions WHERE market_slug=? AND source=? AND status='open' LIMIT 1",
+            (market_slug, source),
+        )
+        return row is not None

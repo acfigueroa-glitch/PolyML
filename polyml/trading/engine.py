@@ -270,22 +270,54 @@ class TradeEngine:
             pass
 
     def _discover_games(self) -> None:
-        """Pick currently-open markets to trade (defaults to a few open ones)."""
+        """Pick live games to trade.
+
+        Prefers the markets you're actively in (positions / open orders) — those
+        are liquid and certain to resolve — then fills remaining slots with other
+        currently-open markets.
+        """
+        max_games = self.config.get("trading.max_games", 5)
+
+        def _add(slug: str | None) -> bool:
+            if not slug or slug in self.watchlist or slug in self._finalized:
+                return False
+            self.watchlist.add(slug)
+            return len(self.watchlist) >= max_games
+
+        # 1) Markets you currently hold or have orders in.
+        for slug in self._involved_market_slugs():
+            if _add(slug):
+                return
+
+        # 2) Other open markets.
         try:
-            markets = self.rest.list_markets(limit=self.config.get("trading.discover_limit", 20)) or {}
+            markets = self.rest.list_markets(
+                limit=self.config.get("trading.discover_limit", 20), closed=False
+            ) or {}
         except Exception as exc:  # noqa: BLE001
             logger.warning("game discovery failed: %s", exc)
             return
-        max_games = self.config.get("trading.max_games", 5)
         for m in markets.get("markets", []):
-            slug = m.get("slug")
-            if not slug or slug in self.watchlist or slug in self._finalized:
-                continue
             if self._is_resolved(m):
                 continue
-            self.watchlist.add(slug)
-            if len(self.watchlist) >= max_games:
-                break
+            if _add(m.get("slug")):
+                return
+
+    def _involved_market_slugs(self) -> list[str]:
+        slugs: list[str] = []
+        try:
+            positions = (self.rest.get_positions() or {}).get("positions", {})
+            if isinstance(positions, dict):
+                slugs.extend(positions.keys())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            orders = (self.rest.get_open_orders() or {}).get("orders", [])
+            slugs.extend(o.get("marketSlug") for o in orders if o.get("marketSlug"))
+        except Exception:  # noqa: BLE001
+            pass
+        # De-dup, preserve order.
+        return list(dict.fromkeys(s for s in slugs if s))
 
     @staticmethod
     def _is_resolved(market: dict) -> bool:

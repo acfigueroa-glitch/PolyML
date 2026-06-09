@@ -165,8 +165,13 @@ class RestClient:
         return resp.json() if resp.content else None
 
     # --- market data (all endpoints on the api host require auth headers) --------
-    def list_markets(self, limit: int = 50, cursor: str | None = None) -> Any:
-        return self.get("/markets", params={"limit": limit, "cursor": cursor}, auth=True)
+    def list_markets(
+        self, limit: int = 50, cursor: str | None = None, closed: bool | None = None
+    ) -> Any:
+        params: dict[str, Any] = {"limit": limit, "cursor": cursor}
+        if closed is not None:
+            params["closed"] = "true" if closed else "false"
+        return self.get("/markets", params=params, auth=True)
 
     def get_market(self, slug: str) -> Any:
         return self.get(f"/markets/{slug}", auth=True)

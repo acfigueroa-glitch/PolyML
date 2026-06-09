@@ -205,7 +205,10 @@ class Database:
 
     # --- low-level helpers -------------------------------------------------------
     def close(self) -> None:
-        self.conn.close()
+        # Take the write lock so we never close the connection out from under a
+        # worker-thread write that is still in flight during shutdown.
+        with self._lock:
+            self.conn.close()
 
     def __enter__(self) -> "Database":
         return self

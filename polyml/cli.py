@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -22,6 +24,8 @@ from polyml.analysis.learner import Learner
 from polyml.analysis.outcomes import OutcomeLinker
 from polyml.config import load_config
 from polyml.storage.db import Database
+
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging(config) -> None:
@@ -52,15 +56,41 @@ def cmd_run(config) -> int:
     async def _main() -> None:
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
+
+        def _request_stop() -> None:
+            # First signal: ask for a graceful shutdown. A second signal means
+            # the user is insisting — bail hard rather than wait on blocking
+            # I/O in worker threads that won't respond to cancellation.
+            if stop.is_set():
+                logger.warning("forced shutdown")
+                os._exit(130)
+            logger.info("stop requested — shutting down (press Ctrl-C again to force-quit)")
+            stop.set()
+
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, stop.set)
+                loop.add_signal_handler(sig, _request_stop)
             except NotImplementedError:  # pragma: no cover - Windows
                 pass
+
         run_task = asyncio.create_task(runner.run())
-        await stop.wait()
-        await runner.shutdown()
-        run_task.cancel()
+        stop_task = asyncio.create_task(stop.wait())
+        await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        stop_task.cancel()
+
+        abandoned = await runner.shutdown()
+        if not run_task.done():
+            run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+        if abandoned:
+            # Those tasks are wedged on uninterruptible blocking I/O; asyncio.run()
+            # would otherwise hang joining their worker threads. Exit now.
+            logger.warning("%d task(s) would not stop; exiting now", abandoned)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
     asyncio.run(_main())
     return 0

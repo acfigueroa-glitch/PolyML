@@ -31,6 +31,11 @@ from polyml.storage.db import Database
 
 logger = logging.getLogger(__name__)
 
+# How long a graceful shutdown waits for tasks to unwind before giving up and
+# abandoning whatever is still stuck (e.g. a worker thread blocked in a
+# non-cancellable REST call). Bounded so "stop the bot" can never hang forever.
+SHUTDOWN_GRACE_SECONDS = 10.0
+
 
 class Runner:
     def __init__(self, config: Config) -> None:
@@ -169,15 +174,45 @@ class Runner:
             except Exception:  # noqa: BLE001
                 logger.exception("stale sweep failed")
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, timeout: float = SHUTDOWN_GRACE_SECONDS) -> int:
+        """Stop every loop and release resources.
+
+        Asks each component to stop, cancels the tasks, then waits up to
+        ``timeout`` for them to finish. Tasks blocked on uninterruptible work
+        in a worker thread (a REST call, a ``time.sleep`` backoff) may not
+        unwind in time; rather than hang, we abandon them and return how many
+        were still running so the caller can decide to force-exit.
+        """
         logger.info("shutting down...")
-        self.market_collector.stop()
-        self.account_collector.stop()
-        self.activity_poller.stop()
-        self.private_ws.stop()
-        self.markets_ws.stop()
+        for component in (
+            self.market_collector,
+            self.account_collector,
+            self.activity_poller,
+            self.private_ws,
+            self.markets_ws,
+        ):
+            component.stop()
         for task in self._tasks:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        abandoned = 0
+        if self._tasks:
+            # asyncio.wait() returns after the timeout WITHOUT re-awaiting the
+            # pending tasks, so a wedged task can't drag shutdown out (unlike
+            # gather/wait_for, which block until cancellation completes).
+            done, pending = await asyncio.wait(self._tasks, timeout=timeout)
+            for task in done:
+                if not task.cancelled() and task.exception() is not None:
+                    logger.debug("task %s ended with: %s", task.get_name(), task.exception())
+            if pending:
+                abandoned = len(pending)
+                logger.warning(
+                    "shutdown timed out after %.0fs; abandoning %d stuck task(s): %s",
+                    timeout,
+                    abandoned,
+                    ", ".join(sorted(t.get_name() for t in pending)),
+                )
+        self._tasks = []
         self.rest.close()
         self.db.close()
+        return abandoned

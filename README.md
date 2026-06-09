@@ -98,11 +98,19 @@ a session per market, and analyzes each one when it resolves.
 | Command | What it does |
 |---------|--------------|
 | `polyml run` | Start the live observe-and-learn loop (needs credentials). |
+| `polyml backfill [--pages N]` | Pull your settled history, build & analyze sessions for already-resolved markets, then train. Great first run. |
 | `polyml status` | Show how much has been collected (row counts, sessions, latest balance). |
 | `polyml discover` | List markets you're involved in and available markets. |
 | `polyml analyze [--slug S] [--all]` | Link decisions to outcomes for concluded sessions. |
 | `polyml report [--slug S \| --session N]` | Print a session's analysis: decisions, lessons, counterfactuals. |
 | `polyml train` | Train the learner on all accumulated decisions. |
+
+> **Note on `backfill` vs `run`.** Backfill reconstructs sessions from your
+> settled trade history, so it gives you **real labels, PnL, and counterfactuals**
+> immediately. But the *predictive features* (order-book imbalance, momentum,
+> spread at each decision) can only be captured live — there's no historical
+> order-book snapshot for a market that already resolved. So the learner becomes
+> genuinely predictive once `polyml run` has been collecting during your sessions.
 
 ---
 
@@ -194,3 +202,19 @@ Built against the official Polymarket US documentation at
 <https://docs.polymarket.us> (REST base `https://api.polymarket.us/v1`, order-book
 gateway `https://gateway.polymarket.us/v1`, public stream `…/ws/markets`, private
 stream `…/ws/private`, Ed25519 request signing).
+
+Verified against the live API, with a few specifics not obvious from the docs:
+
+- **Every endpoint on the `api.polymarket.us` host requires the signed headers** —
+  including market data (`/markets`, `/markets/{slug}/bbo`). Only the gateway
+  order book (`gateway.polymarket.us/.../book`) is public.
+- The signed message is `"{timestamp}{METHOD}{path}"` with the **path only — no
+  query string**.
+- Open orders are at `GET /orders/open`; activities want
+  `sortOrder=SORT_ORDER_DESCENDING`.
+- `positions` is a **map keyed by market slug**; a trade nests its fill under
+  `aggressorExecution`/`passiveExecution`; a position resolution settles the long
+  outcome to `market.outcomePrices[0]` and reports the final realized PnL in
+  `afterPosition.realized`.
+- The API is behind Cloudflare rate-limiting (HTTP 429); the client backs off and
+  retries, and paging is bounded so a poll doesn't trip it.

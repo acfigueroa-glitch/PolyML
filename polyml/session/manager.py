@@ -40,6 +40,16 @@ class SessionManager:
         return self.db.get_or_open_session(slug)
 
     def _session_realized_pnl(self, slug: str) -> float:
+        # The resolution activity carries the position's final cumulative
+        # realized PnL — authoritative, so prefer it over summing trades.
+        res = self.db.query_one(
+            "SELECT realized_pnl FROM activities WHERE market_slug=? "
+            "AND activity_type LIKE '%RESOLUTION%' AND realized_pnl IS NOT NULL "
+            "ORDER BY create_time DESC LIMIT 1",
+            (slug,),
+        )
+        if res and res["realized_pnl"] is not None:
+            return float(res["realized_pnl"])
         row = self.db.query_one(
             "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM activities "
             "WHERE market_slug=? AND realized_pnl IS NOT NULL",

@@ -147,6 +147,47 @@ def cmd_report(config, args) -> int:
     return 0
 
 
+def cmd_backfill(config, args) -> int:
+    """Pull settled history, build sessions for resolved markets, analyze, train."""
+    from polyml.api.auth import Ed25519Signer
+    from polyml.api.rest import RestClient
+    from polyml.mirror import ActivityPoller
+    from polyml.session import SessionManager
+
+    if not config.credentials.is_complete:
+        print("error: backfill needs credentials (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY).",
+              file=sys.stderr)
+        return 2
+    signer = Ed25519Signer.from_credentials(config.credentials.key_id, config.credentials.secret_key)
+    rest = RestClient(config.rest_base_url, config.gateway_base_url, signer=signer)
+    db = Database(config.db_path)
+
+    poller = ActivityPoller(rest, db)
+    n = poller.backfill(max_pages=args.pages)
+    print(f"Fetched {n} activities across up to {args.pages} pages.")
+
+    sm = SessionManager(db)
+    linker = OutcomeLinker(db)
+    outcomes = db.query("SELECT market_slug FROM outcomes")
+    print(f"Resolved markets with outcomes: {len(outcomes)}")
+    for row in outcomes:
+        slug = row["market_slug"]
+        sm.open_session(slug)
+        sm.conclude_if_resolved(slug)
+        s = db.query_one("SELECT id FROM sessions WHERE market_slug=? ORDER BY id DESC LIMIT 1", (slug,))
+        report = linker.link_session(int(s["id"]), slug)
+        db.mark_session_analyzed(int(s["id"]), json.dumps(report, default=str))
+        print(f"  {slug}: pnl={report['realized_pnl']:+.2f} "
+              f"good={report['good_decisions']} bad={report['bad_decisions']} "
+              f"decisions={report['n_decisions']}")
+
+    learner = _make_learner(config, db)
+    print("\n" + learner.train().summary())
+    rest.close()
+    db.close()
+    return 0
+
+
 def cmd_train(config) -> int:
     db = Database(config.db_path)
     learner = _make_learner(config, db)
@@ -211,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("train", help="Train the learner on accumulated decisions")
     sub.add_parser("discover", help="List markets you're involved in and available markets")
+
+    p_backfill = sub.add_parser("backfill", help="Pull settled history and analyze resolved markets")
+    p_backfill.add_argument("--pages", type=int, default=20, help="Max activity pages to fetch")
     return parser
 
 
@@ -232,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_train(config)
     if args.command == "discover":
         return cmd_discover(config)
+    if args.command == "backfill":
+        return cmd_backfill(config, args)
     parser.error(f"unknown command: {args.command}")
     return 1
 

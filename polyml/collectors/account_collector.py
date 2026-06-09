@@ -44,11 +44,16 @@ class AccountCollector:
             return
         if not payload:
             return
+        # The API returns {"balances": [ {...} ]} (one entry per currency).
         data = payload.get("balances", payload)
-        # Field names vary; probe the common ones.
+        if isinstance(data, list):
+            data = data[0] if data else {}
         buying_power = parse_money(_first(data, "buyingPower", "buying_power", "availableBalance"))
-        total_value = parse_money(_first(data, "totalValue", "equity", "portfolioValue"))
-        cash = parse_money(_first(data, "cash", "cashBalance", "available"))
+        cash = parse_money(_first(data, "currentBalance", "cash", "cashBalance"))
+        asset = parse_money(_first(data, "assetNotional")) or 0.0
+        total_value = (cash or 0.0) + asset if cash is not None else parse_money(
+            _first(data, "totalValue", "equity")
+        )
         self.db.insert_balance(buying_power, total_value, cash, raw=payload)
 
     def collect_positions(self) -> None:
@@ -59,13 +64,19 @@ class AccountCollector:
             return
         if not payload:
             return
-        positions = payload.get("positions", payload if isinstance(payload, list) else [])
-        for pos in positions:
-            slug = pos.get("marketSlug") or pos.get("market_slug")
-            net = parse_decimal(_first(pos, "netPositionDecimal", "netPosition", "quantity"))
-            avg = parse_money(_first(pos, "avgPrice", "averagePrice", "costBasis"))
-            upnl = parse_money(_first(pos, "unrealizedPnl", "unrealized_pnl"))
-            self.db.insert_position(slug, net, avg, upnl, raw=pos)
+        # The API returns {"positions": { "<slug>": {...}, ... }} keyed by slug.
+        positions = payload.get("positions", payload)
+        items = positions.items() if isinstance(positions, dict) else (
+            (p.get("marketSlug"), p) for p in positions
+        )
+        for slug, pos in items:
+            slug = slug or pos.get("marketSlug")
+            net = parse_decimal(_first(pos, "netPosition", "netPositionDecimal", "quantity"))
+            cost = parse_money(_first(pos, "cost", "costBasis"))
+            # Average entry price = total cost / |net position|.
+            avg = (cost / abs(net)) if (cost is not None and net not in (None, 0.0)) else None
+            realized = parse_money(_first(pos, "realized", "realizedPnl"))
+            self.db.insert_position(slug, net, avg, realized, raw=pos)
             if slug and net not in (None, 0.0):
                 self.involved_slugs.add(slug)
 
@@ -83,15 +94,15 @@ class AccountCollector:
             self.db.insert_order_event(
                 order_id=order.get("id") or order.get("orderId"),
                 market_slug=slug,
-                side=order.get("side"),
+                side=order.get("intent") or order.get("side"),
                 order_type=order.get("type"),
                 price=parse_money(order.get("price")),
                 quantity=parse_decimal(order.get("quantity")),
-                filled_qty=parse_decimal(_first(order, "filledQuantity", "filledQty")),
+                filled_qty=parse_decimal(_first(order, "cumQuantity", "filledQuantity", "filledQty")),
                 state=order.get("state"),
                 event_type="snapshot",
                 source="rest",
-                event_time=order.get("updateTime") or order.get("createTime"),
+                event_time=order.get("updateTime") or order.get("createTime") or order.get("insertTime"),
                 raw=order,
             )
             if slug:

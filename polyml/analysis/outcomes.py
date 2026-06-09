@@ -25,10 +25,19 @@ logger = logging.getLogger(__name__)
 
 
 def _is_buy(side: str | None) -> bool:
+    """True if the order acquired its instrument (BUY action), regardless of
+    whether the instrument is the long or short side."""
     s = (side or "").upper()
-    if "SELL" in s or "SHORT" in s:
+    if "BUY" in s:
+        return True
+    if "SELL" in s:
         return False
-    return "BUY" in s or "LONG" in s
+    # Bare intents without an explicit action: LONG implies buy-long.
+    return "LONG" in s and "SELL" not in s
+
+
+def _is_short(side: str | None) -> bool:
+    return "SHORT" in (side or "").upper()
 
 
 def _side_from_raw(raw: Any) -> str | None:
@@ -42,9 +51,14 @@ def _side_from_raw(raw: Any) -> str | None:
     if not isinstance(obj, dict):
         return None
     trade = obj.get("trade", obj)
-    for key in ("side", "intent", "orderIntent", "aggressorSide"):
-        if isinstance(trade, dict) and trade.get(key):
-            return str(trade[key])
+    # Real trades nest the order under aggressorExecution / passiveExecution.
+    if isinstance(trade, dict):
+        execution = trade.get("aggressorExecution") or trade.get("passiveExecution") or {}
+        order = execution.get("order", {}) if isinstance(execution, dict) else {}
+        for source in (order, trade):
+            for key in ("intent", "side", "action", "orderIntent"):
+                if isinstance(source, dict) and source.get(key):
+                    return str(source[key])
     return None
 
 
@@ -127,47 +141,65 @@ class OutcomeLinker:
             )
             position += signed
 
-        report = self._build_report(slug, resolved, total_pnl, decisions)
+        # Authoritative session PnL = the resolution's final realized figure
+        # (set on the session row at conclusion); the per-trade sum omits the
+        # settlement of shares held to resolution, so prefer the session value.
+        srow = self.db.query_one("SELECT realized_pnl FROM sessions WHERE id=?", (session_id,))
+        session_pnl = (
+            float(srow["realized_pnl"]) if srow and srow["realized_pnl"] is not None else total_pnl
+        )
+        report = self._build_report(slug, resolved, session_pnl, decisions, intra_trade_pnl=total_pnl)
         return report
 
     # --- labelling & counterfactuals --------------------------------------------
     @staticmethod
-    def _label(decision_type, side, price, realized, resolved) -> int | None:
-        """1 = good decision, 0 = bad, None = undetermined."""
-        if realized is not None and decision_type in ("exit", "reduce"):
-            return 1 if realized >= 0 else 0
-        if resolved is None or price is None:
+    def _instrument_settle(side: str | None, resolved: float | None) -> float | None:
+        """Settlement (0..1) of the instrument this trade was on. ``resolved`` is
+        the long side's settled value; the short instrument settles to 1-that."""
+        if resolved is None:
             return None
-        # Fair value at resolution is `resolved` for a YES/long position.
-        fair = resolved if _is_buy(side) else (1.0 - resolved)
-        # Buying below fair (or selling above) is a good decision.
+        return (1.0 - resolved) if _is_short(side) else resolved
+
+    @staticmethod
+    def _label(decision_type, side, price, realized, resolved) -> int | None:
+        """1 = good decision, 0 = bad, None = undetermined.
+
+        Realized PnL is authoritative when present; otherwise we compare the fill
+        price to the instrument's settlement (a buy is good below settlement, a
+        sell is good above it).
+        """
+        if realized is not None and abs(realized) > 1e-9:
+            return 1 if realized > 0 else 0
+        settle = OutcomeLinker._instrument_settle(side, resolved)
+        if settle is None or price is None:
+            return None
         if _is_buy(side):
-            return 1 if fair >= price else 0
-        return 1 if price >= (1.0 - fair) else 0
+            return 1 if settle >= price else 0
+        return 1 if price >= settle else 0
 
     @staticmethod
     def _counterfactual(decision_type, side, price, resolved) -> str | None:
-        if resolved is None or price is None:
+        settle = OutcomeLinker._instrument_settle(side, resolved)
+        if settle is None or price is None:
             return None
-        if decision_type in ("exit", "reduce") and _is_buy(side) is False:
-            # Sold a long position at `price`; holding would have paid `resolved`.
-            diff = resolved - price
+        if _is_buy(side):
+            edge = settle - price
+            if edge > 0.01:
+                return f"Good entry: bought at {price:.2f}, instrument settled {settle:.2f} (+{edge:.2f}/share)."
+            if edge < -0.01:
+                return (
+                    f"Entry at {price:.2f} was above the {settle:.2f} settlement — "
+                    f"lost {abs(edge):.2f}/share. The position never had fair-value edge."
+                )
+        else:  # a sell / exit
+            diff = settle - price
             if diff > 0.01:
                 return (
                     f"Exiting at {price:.2f} left {diff:.2f}/share on the table — "
-                    f"the market resolved to {resolved:.2f}. Holding would have been better."
+                    f"the instrument settled to {settle:.2f}. Holding would have been better."
                 )
             if diff < -0.01:
-                return f"Good exit: you sold at {price:.2f}; it resolved to {resolved:.2f}."
-        if decision_type in ("entry", "add") and _is_buy(side):
-            edge = resolved - price
-            if edge > 0.01:
-                return f"Strong entry: bought at {price:.2f}, resolved {resolved:.2f} (+{edge:.2f}/share)."
-            if edge < -0.01:
-                return (
-                    f"Entry at {price:.2f} was above the {resolved:.2f} resolution — "
-                    f"the position lost {abs(edge):.2f}/share."
-                )
+                return f"Good exit: sold at {price:.2f}; it settled to {settle:.2f}."
         return None
 
     def _overlooked_indicators(self, feats: dict[str, float], label_good: int | None) -> list[str]:
@@ -191,10 +223,11 @@ class OutcomeLinker:
         return flags
 
     # --- report ------------------------------------------------------------------
-    def _build_report(self, slug, resolved, total_pnl, decisions) -> dict[str, Any]:
+    def _build_report(self, slug, resolved, session_pnl, decisions, *, intra_trade_pnl=0.0) -> dict[str, Any]:
         good = sum(1 for d in decisions if d["label_good"] == 1)
         bad = sum(1 for d in decisions if d["label_good"] == 0)
         lessons: list[str] = []
+        # Cap the lesson list so high-frequency sessions stay readable.
         for d in decisions:
             if d["counterfactual"]:
                 lessons.append(d["counterfactual"])
@@ -203,10 +236,11 @@ class OutcomeLinker:
         return {
             "market_slug": slug,
             "resolved_value": resolved,
-            "realized_pnl": round(total_pnl, 4),
+            "realized_pnl": round(session_pnl, 4),
+            "intra_session_realized": round(intra_trade_pnl, 4),
             "n_decisions": len(decisions),
             "good_decisions": good,
             "bad_decisions": bad,
             "decisions": decisions,
-            "lessons": lessons,
+            "lessons": lessons[:40],
         }

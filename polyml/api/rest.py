@@ -22,6 +22,7 @@ PolyML is observe-only and never places, modifies, or cancels orders.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -51,11 +52,13 @@ class RestClient:
         signer: Ed25519Signer | None = None,
         timeout: float = 30.0,
         client: httpx.Client | None = None,
+        max_retries: int = 4,
     ) -> None:
         self.rest_base_url = rest_base_url.rstrip("/")
         self.gateway_base_url = gateway_base_url.rstrip("/")
         self.signer = signer
         self._client = client or httpx.Client(timeout=timeout)
+        self.max_retries = max_retries
         # The path prefix used when signing (everything after the host).
         self._rest_path_prefix = httpx.URL(self.rest_base_url).path.rstrip("/")
 
@@ -91,44 +94,64 @@ class RestClient:
         if auth:
             if self.signer is None:
                 raise PolymarketAPIError(401, url, "Authenticated call requires credentials")
-            # Sign the host-relative path including the API version prefix.
+            # The server signs the host-relative path WITHOUT the query string
+            # (verified empirically: query-bearing requests fail signature checks
+            # when the query is included in the signed message).
             sign_path = httpx.URL(url).path
-            if httpx.URL(url).query:
-                sign_path += "?" + httpx.URL(url).query.decode()
             headers.update(self.signer.headers(method, sign_path))
 
         logger.debug("%s %s (auth=%s)", method, url, auth)
-        resp = self._client.request(method, url, headers=headers)
+        resp = self._request_with_retry(method, url, headers)
         if resp.status_code >= 400:
             raise PolymarketAPIError(resp.status_code, url, resp.text)
         if not resp.content:
             return None
         return resp.json()
 
+    def _request_with_retry(self, method: str, url: str, headers: dict[str, str]) -> httpx.Response:
+        """Send the request, backing off on 429/503 (respecting Retry-After).
+
+        For authenticated requests the timestamp/signature are regenerated on
+        each attempt so they stay within the server's clock-skew window.
+        """
+        attempt = 0
+        while True:
+            resp = self._client.request(method, url, headers=headers)
+            if resp.status_code not in (429, 503) or attempt >= self.max_retries:
+                return resp
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else 2.0 * (2 ** attempt)
+            except ValueError:
+                delay = 2.0 * (2 ** attempt)
+            delay = min(delay, 30.0)
+            logger.warning("rate-limited (%s) on %s; retrying in %.1fs", resp.status_code, url, delay)
+            time.sleep(delay)
+            attempt += 1
+            if self.signer is not None and headers.get("X-PM-Signature"):
+                headers.update(self.signer.headers(method, httpx.URL(url).path))
+
     def get(self, path: str, **kw: Any) -> Any:
         return self._request("GET", path, **kw)
 
-    # --- public market data ------------------------------------------------------
+    # --- market data (all endpoints on the api host require auth headers) --------
     def list_markets(self, limit: int = 50, cursor: str | None = None) -> Any:
-        return self.get("/markets", params={"limit": limit, "cursor": cursor})
+        return self.get("/markets", params={"limit": limit, "cursor": cursor}, auth=True)
 
     def get_market(self, slug: str) -> Any:
-        return self.get(f"/markets/{slug}")
+        return self.get(f"/markets/{slug}", auth=True)
 
     def get_market_bbo(self, slug: str) -> Any:
-        return self.get(f"/markets/{slug}/bbo")
+        return self.get(f"/markets/{slug}/bbo", auth=True)
 
     def get_market_book(self, slug: str) -> Any:
-        """The order book lives on the gateway host per the docs."""
+        """The order book lives on the gateway host and is public (no auth)."""
         return self.get(f"/markets/{slug}/book", base=self.gateway_base_url)
 
     def list_events(self, limit: int = 50, cursor: str | None = None) -> Any:
-        return self.get("/events", params={"limit": limit, "cursor": cursor})
+        return self.get("/events", params={"limit": limit, "cursor": cursor}, auth=True)
 
     # --- authenticated account / portfolio --------------------------------------
-    def who_am_i(self) -> Any:
-        return self.get("/accounts/who-am-i", auth=True)
-
     def get_balances(self) -> Any:
         return self.get("/account/balances", auth=True)
 
@@ -136,7 +159,7 @@ class RestClient:
         return self.get("/portfolio/positions", auth=True)
 
     def get_open_orders(self) -> Any:
-        return self.get("/orders", auth=True)
+        return self.get("/orders/open", auth=True)
 
     def get_activities(
         self,
@@ -145,7 +168,7 @@ class RestClient:
         cursor: str | None = None,
         market_slug: str | None = None,
         types: list[str] | None = None,
-        sort_order: str = "DESCENDING",
+        sort_order: str = "SORT_ORDER_DESCENDING",
     ) -> Any:
         return self.get(
             "/portfolio/activities",
@@ -159,15 +182,24 @@ class RestClient:
             },
         )
 
-    def iter_activities(self, **kw: Any) -> Any:
-        """Yield activity records across all pages (handles cursor pagination)."""
+    def iter_activities(self, *, max_pages: int = 2, page_pause: float = 0.4, **kw: Any) -> Any:
+        """Yield activity records across pages (handles cursor pagination).
+
+        ``max_pages`` bounds how deep we page in one call so a periodic poll
+        doesn't trip the API rate limiter; pass a large value for a full
+        historical backfill. ``page_pause`` spaces out paged requests.
+        """
         cursor = kw.pop("cursor", None)
-        while True:
+        pages = 0
+        while pages < max_pages:
             page = self.get_activities(cursor=cursor, **kw)
             if not page:
                 return
             for activity in page.get("activities", []):
                 yield activity
+            pages += 1
             if page.get("eof") or not page.get("nextCursor"):
                 return
             cursor = page["nextCursor"]
+            if pages < max_pages:
+                time.sleep(page_pause)

@@ -31,6 +31,26 @@ _EXEC_EVENT = {
 }
 
 
+def _resolved_long_value(market: dict, after: dict, before: dict) -> float | None:
+    """Settlement value (0..1) of the market's long/first outcome.
+
+    Polymarket settles a binary market's outcomes to 1 (winner) and 0 (loser);
+    ``outcomePrices[0]`` is the long instrument's settled price. Falls back to
+    cash received per share if the market block is absent.
+    """
+    prices = market.get("outcomePrices")
+    if isinstance(prices, list) and prices:
+        try:
+            return float(prices[0])
+        except (TypeError, ValueError):
+            pass
+    cash = parse_money(after.get("cashValue"))
+    net = parse_decimal(before.get("netPosition"))
+    if cash is not None and net not in (None, 0.0):
+        return cash / abs(net)
+    return None
+
+
 class ActivityMirror:
     """Async message handler for ``PrivateWebSocket``."""
 
@@ -152,14 +172,31 @@ class ActivityPoller:
         self.on_resolution = on_resolution
         self._stop = asyncio.Event()
 
-    def collect_once(self) -> None:
+    def collect_once(self, *, max_pages: int = 1) -> None:
+        """Fetch recent activities. The periodic poll only needs the newest
+        page; ``backfill`` pages deeper for history."""
         try:
-            activities = list(self.rest.iter_activities(limit=100))
+            activities = list(self.rest.iter_activities(limit=100, max_pages=max_pages))
         except PolymarketAPIError as exc:
             logger.warning("activities fetch failed: %s", exc)
             return
         for activity in activities:
             self._store(activity)
+
+    def backfill(self, *, max_pages: int = 20) -> int:
+        """One-time deeper sweep to capture historical trades and resolutions.
+
+        Returns the number of activities seen. Newly-resolved markets recorded
+        here let the analysis layer learn from already-settled sessions.
+        """
+        count = 0
+        try:
+            for activity in self.rest.iter_activities(limit=100, max_pages=max_pages, page_pause=0.6):
+                self._store(activity)
+                count += 1
+        except PolymarketAPIError as exc:
+            logger.warning("activities backfill stopped: %s", exc)
+        return count
 
     def _store(self, activity: dict[str, Any]) -> None:
         atype = activity.get("type", "")
@@ -168,29 +205,39 @@ class ActivityPoller:
         balance = activity.get("accountBalanceChange")
 
         if trade:
+            # A trade carries the fill under aggressorExecution (you took
+            # liquidity) or passiveExecution (you provided it).
+            agg = trade.get("aggressorExecution")
+            execution = agg or trade.get("passiveExecution") or {}
+            order = execution.get("order", {}) or {}
+            price = parse_money(execution.get("lastPx")) or parse_money(order.get("avgPx"))
+            qty = parse_decimal(execution.get("lastShares"))
+            cost = (price * qty) if (price is not None and qty is not None) else None
             self.db.insert_activity(
                 activity_id=trade.get("id"),
                 activity_type=atype or "ACTIVITY_TYPE_TRADE",
-                market_slug=trade.get("marketSlug"),
-                price=parse_money(trade.get("price")),
-                qty=parse_decimal(trade.get("qtyDecimal")),
-                is_aggressor=1 if trade.get("isAggressor") else 0,
-                cost_basis=parse_money(trade.get("costBasis")),
+                market_slug=order.get("marketSlug") or trade.get("marketSlug"),
+                price=price,
+                qty=qty,
+                is_aggressor=1 if agg else 0,
+                cost_basis=parse_money(trade.get("costBasis")) or cost,
                 realized_pnl=parse_money(trade.get("realizedPnl")),
-                create_time=trade.get("createTime"),
+                create_time=execution.get("transactTime") or order.get("createTime")
+                or trade.get("createTime"),
                 raw=activity,
             )
         elif resolution:
             slug = resolution.get("marketSlug")
-            resolved_value = parse_money(
-                resolution.get("resolvedValue") or resolution.get("settlementPrice")
-            )
-            res_time = resolution.get("resolutionTime") or resolution.get("updateTime")
+            after = resolution.get("afterPosition", {}) or {}
+            before = resolution.get("beforePosition", {}) or {}
+            resolved_value = _resolved_long_value(resolution.get("market", {}) or {}, after, before)
+            realized = parse_money(after.get("realized"))
+            res_time = resolution.get("updateTime") or after.get("updateTime")
             self.db.insert_activity(
-                activity_id=resolution.get("id") or f"res-{slug}",
+                activity_id=f"res-{slug}",
                 activity_type=atype or "ACTIVITY_TYPE_POSITION_RESOLUTION",
                 market_slug=slug,
-                realized_pnl=parse_money(resolution.get("realizedPnl")),
+                realized_pnl=realized,
                 create_time=res_time,
                 raw=activity,
             )

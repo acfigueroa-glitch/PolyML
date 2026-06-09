@@ -75,7 +75,7 @@ def test_outcome_linker_labels_and_counterfactual(tmp_path):
     d = report["decisions"][0]
     assert d["decision_type"] == "entry"
     assert d["label_good"] == 1
-    assert d["counterfactual"] and "Strong entry" in d["counterfactual"]
+    assert d["counterfactual"] and "Good entry" in d["counterfactual"]
     # Decision row persisted.
     assert db.query_one("SELECT COUNT(*) AS n FROM decisions")["n"] == 1
     db.close()

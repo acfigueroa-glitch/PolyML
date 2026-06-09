@@ -97,6 +97,9 @@ class OutcomeLinker:
         decisions: list[dict[str, Any]] = []
         position = 0.0
         total_pnl = 0.0
+        total_est_fee = 0.0
+        total_actual_fee = 0.0
+        saw_actual_fee = False
 
         for trade in trades:
             raw = trade["raw"]
@@ -111,6 +114,13 @@ class OutcomeLinker:
             realized = trade["realized_pnl"]
             if realized is not None:
                 total_pnl += realized
+
+            est_fee = trade["est_fee"] if "est_fee" in trade.keys() else None
+            actual_fee = trade["actual_fee"] if "actual_fee" in trade.keys() else None
+            total_est_fee += est_fee or 0.0
+            if actual_fee is not None:
+                total_actual_fee += actual_fee
+                saw_actual_fee = True
 
             label_good = self._label(decision_type, side, price, realized, resolved)
 
@@ -134,6 +144,8 @@ class OutcomeLinker:
                     "size": qty,
                     "decided_at": when,
                     "realized_pnl": realized,
+                    "est_fee": est_fee,
+                    "actual_fee": actual_fee,
                     "label_good": label_good,
                     "counterfactual": self._counterfactual(decision_type, side, price, resolved),
                     "overlooked": self._overlooked_indicators(feats, label_good),
@@ -148,7 +160,13 @@ class OutcomeLinker:
         session_pnl = (
             float(srow["realized_pnl"]) if srow and srow["realized_pnl"] is not None else total_pnl
         )
-        report = self._build_report(slug, resolved, session_pnl, decisions, intra_trade_pnl=total_pnl)
+        fees = {
+            "estimated": round(total_est_fee, 5),
+            "actual": round(total_actual_fee, 5) if saw_actual_fee else None,
+        }
+        report = self._build_report(
+            slug, resolved, session_pnl, decisions, intra_trade_pnl=total_pnl, fees=fees
+        )
         return report
 
     # --- labelling & counterfactuals --------------------------------------------
@@ -223,7 +241,10 @@ class OutcomeLinker:
         return flags
 
     # --- report ------------------------------------------------------------------
-    def _build_report(self, slug, resolved, session_pnl, decisions, *, intra_trade_pnl=0.0) -> dict[str, Any]:
+    def _build_report(
+        self, slug, resolved, session_pnl, decisions, *, intra_trade_pnl=0.0, fees=None
+    ) -> dict[str, Any]:
+        fees = fees or {"estimated": 0.0, "actual": None}
         good = sum(1 for d in decisions if d["label_good"] == 1)
         bad = sum(1 for d in decisions if d["label_good"] == 0)
         lessons: list[str] = []
@@ -233,11 +254,20 @@ class OutcomeLinker:
                 lessons.append(d["counterfactual"])
             for o in d["overlooked"]:
                 lessons.append(f"At your {d['decision_type']} ({d['decided_at']}): {o}")
+        # Fees are pure drag: flag them when they materially erode the result.
+        paid_fee = fees["actual"] if fees.get("actual") is not None else fees.get("estimated", 0.0)
+        if paid_fee and abs(session_pnl) > 1e-9 and paid_fee >= 0.1 * abs(session_pnl):
+            lessons.append(
+                f"Fees ({'actual' if fees.get('actual') is not None else 'est.'} ${paid_fee:.2f}) "
+                f"were a sizeable share of the ${abs(session_pnl):.2f} result — taker fills are "
+                f"costliest near 50% (fee = contracts x rate x price x (1-price))."
+            )
         return {
             "market_slug": slug,
             "resolved_value": resolved,
             "realized_pnl": round(session_pnl, 4),
             "intra_session_realized": round(intra_trade_pnl, 4),
+            "fees": fees,
             "n_decisions": len(decisions),
             "good_decisions": good,
             "bad_decisions": bad,

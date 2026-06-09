@@ -34,6 +34,34 @@ def parse_decimal(obj: Any) -> float | None:
     return parse_money(obj)
 
 
+# Candidate keys the API might use for the trade fee, most-specific first. The
+# live fixtures don't yet pin the exact name, so we also fall back to any key
+# containing "fee" (ignoring booleans like "feePayer").
+_FEE_KEYS = ("fee", "feeAmount", "feePaid", "takerFee", "fees", "commission")
+
+
+def parse_fee(*payloads: Any) -> float | None:
+    """Best-effort actual fee from one or more trade/execution payloads.
+
+    Checks the known fee keys across each payload, then any ``*fee*`` key, and
+    returns the first parseable money value. Returns ``None`` if no fee field is
+    present (e.g. a maker fill, or an API shape that omits it)."""
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in _FEE_KEYS:
+            if key in payload:
+                value = parse_money(payload[key])
+                if value is not None:
+                    return value
+        for key, raw in payload.items():
+            if "fee" in key.lower() and not isinstance(raw, bool):
+                value = parse_money(raw)
+                if value is not None:
+                    return value
+    return None
+
+
 def parse_time(value: Any) -> datetime | None:
     """Parse an ISO-8601 timestamp (with optional trailing 'Z')."""
     if value is None:

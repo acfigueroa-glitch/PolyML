@@ -165,6 +165,11 @@ def cmd_report(config, args) -> int:
     print(f"outcome={row['outcome_value']}  realized_pnl={row['realized_pnl']}")
     if row["summary"]:
         report = json.loads(row["summary"])
+        fees = report.get("fees") or {}
+        if fees.get("estimated") is not None:
+            actual = fees.get("actual")
+            actual_str = f"  actual=${actual:.4f}" if actual is not None else "  actual=n/a"
+            print(f"fees: estimated=${fees['estimated']:.4f}{actual_str}")
         print(f"\nDecisions: {report['n_decisions']}  good={report['good_decisions']}  bad={report['bad_decisions']}")
         for d in report.get("decisions", []):
             print(f"  - {d['decided_at']} {d['decision_type']} {d['side']} "
